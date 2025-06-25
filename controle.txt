@@ -1,0 +1,43 @@
+seq 1-20:
+mass = 8300
+friction = 1.0
+
+seq 21-40:
+mass = 10900
+friction = 1.0
+
+seq 41-60:
+mass = 13500
+friction = 1.0
+
+seq 61-80:
+mass = 13500
+friction = 1.0
+
+seq 81-100:
+mass = 10900
+friction = 1.0
+
+seq 101-120:
+mass = 8300
+friction = 0.75
+
+seq 121-140:
+mass = 10900
+friction = 0.75
+
+seq 141-160:
+mass = 13500
+friction = 0.75
+
+seq 161-180:
+mass = 13500
+friction = 0.5
+
+seq 181-200:
+mass = 10900
+friction = 0.5
+
+seq 201-220:
+mass = 8300
+friction = 0.5

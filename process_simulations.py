@@ -1,9 +1,11 @@
 import os
 import json
-import math
 import pandas as pd
 from pyproj import Proj, transform
 import numpy as np
+from typing import List, Dict, Any, Tuple
+
+# --- Constants ---
 
 # Data model mapping sensor names to their device IDs
 DATA_MODEL = {
@@ -16,23 +18,31 @@ DATA_MODEL = {
 }
 
 # Define WGS84 and ECEF projections for coordinate conversion
-wgs84 = Proj(proj='latlong', ellps='WGS84', datum='WGS84')
-ecef = Proj(proj='geocent', ellps='WGS84', datum='WGS84')
+WGS84 = Proj(proj='latlong', ellps='WGS84', datum='WGS84')
+ECEF = Proj(proj='geocent', ellps='WGS84', datum='WGS84')
 
-def get_ecef_from_wgs84(lat, lon, alt):
+# Proximity check constants
+PROXIMITY_RADIUS_M = 5
+PROXIMITY_RADIUS_SQ = PROXIMITY_RADIUS_M**2
+POINT_FEATURE_TYPES = ["pothole", "speedbump", "elevated_crosswalk", "cut"]
+
+
+# --- Helper Functions ---
+
+def get_ecef_from_wgs84(lat: float, lon: float, alt: float) -> tuple:
     """
     Converts WGS84 coordinates to ECEF, applying specific truncation.
     """
     lon = float(int(float(lon) * 100000000.) / 100000000.)
     lat = float(int(float(lat) * 100000000.) / 100000000.)
     alt = float(int(float(alt) * 1000.) / 1000.)
-    return transform(wgs84, ecef, lon, lat, alt, radians=False)
+    return transform(WGS84, ECEF, lon, lat, alt, radians=False)
 
-def get_dist_sq(p1, p2):
+def get_dist_sq(p1: List[float], p2: List[float]) -> float:
     """Calculates the squared Euclidean distance between two 3D points."""
     return (p1[0] - p2[0])**2 + (p1[1] - p2[1])**2 + (p1[2] - p2[2])**2
 
-def get_point_to_line_segment_dist_sq(p, a, b):
+def get_point_to_line_segment_dist_sq(p: List[float], a: List[float], b: List[float]) -> Tuple[float, List[float]]:
     """
     Calculates the squared distance from a point p to a line segment ab.
     Returns the squared distance and the closest point on the segment.
@@ -51,27 +61,79 @@ def get_point_to_line_segment_dist_sq(p, a, b):
     return get_dist_sq(p, projection.tolist()), projection.tolist()
 
 
-def get_map_context(vehicle_pos, map_features_ecef):
+def get_map_context(vehicle_pos: List[float], map_features_ecef: Dict[str, List[Dict]]) -> str:
     """
     Determines the map feature context for a given vehicle position.
     """
     # Check ramps first
     for feature in map_features_ecef.get("ramp", []):
         dist_sq, _ = get_point_to_line_segment_dist_sq(vehicle_pos, feature['start_ecef'], feature['end_ecef'])
-        if dist_sq <= (feature['w'] / 2)**2:
+        if dist_sq <= PROXIMITY_RADIUS_SQ:
             return feature['id']
             
     # Check other features with a radius
-    for feature_type in ["pothole", "speedbump", "elevated_crosswalk", "cut"]:
+    for feature_type in POINT_FEATURE_TYPES:
         for feature in map_features_ecef.get(feature_type, []):
             dist_sq = get_dist_sq(vehicle_pos, feature['center_ecef'])
-            if dist_sq <= feature['r']**2:
+            if dist_sq <= PROXIMITY_RADIUS_SQ:
                 return feature['id']
                 
     return "road"
 
 
-def process_simulation_folder(folder_path, output_dir):
+def post_process_context(df: pd.DataFrame) -> pd.DataFrame:
+    """
+    Post-processes the 'context' column to fill 'road' gaps between identical contexts.
+    For example, [ramp, road, road, ramp] becomes [ramp, ramp, ramp, ramp].
+    """
+    contexts = df['context'].to_list()
+    i = 0
+    while i < len(contexts):
+        # Find start of a potential 'road' block.
+        if contexts[i] == 'road' and i > 0:
+            start_index = i
+            
+            # Find end of the 'road' block
+            j = i
+            while j < len(contexts) and contexts[j] == 'road':
+                j += 1
+            
+            # The block is from start_index to j-1. The element after is at j.
+            context_after_index = j
+            
+            # Check boundaries. We need a context before and after the block.
+            if context_after_index < len(contexts):
+                context_before = contexts[start_index - 1]
+                context_after = contexts[context_after_index]
+                
+                # If contexts surrounding the block are the same and not 'road'
+                if context_before == context_after and context_before != 'road':
+                    # Fill the block
+                    for k in range(start_index, context_after_index):
+                        contexts[k] = context_before
+            
+            # Continue search after the block we just processed
+            i = j
+        else:
+            i += 1
+            
+    df['context'] = contexts
+    return df
+
+
+def _extract_and_pad_series(series: List[Dict], key: str, expected_length: int) -> List[Any]:
+    """Extracts values from a series and pads or truncates to a specific length."""
+    values = [r[key] for r in series]
+    
+    if len(values) > expected_length:
+        return values[:expected_length]
+    elif len(values) < expected_length:
+        values.extend([np.nan] * (expected_length - len(values)))
+    
+    return values
+
+
+def process_simulation_folder(folder_path: str, output_dir: str):
     """
     Processes a single simulation folder, generates, and saves a CSV file.
     """
@@ -86,7 +148,7 @@ def process_simulation_folder(folder_path, output_dir):
         return
 
     # 1. Load and parse context.json
-    with open(context_path, 'r') as f:
+    with open(context_path, 'r', encoding='utf-8') as f:
         context_data = json.load(f)
 
     vehicle_mass = context_data["vehicles"][0]["body"]["mass"]
@@ -95,10 +157,11 @@ def process_simulation_folder(folder_path, output_dir):
     
     # 2. Pre-process map features to get ECEF coordinates and unique IDs
     map_features_ecef = {}
+    id_counts = {} # To track occurrences of each base ID
     for feature_type, features in map_features.items():
         map_features_ecef[feature_type] = []
         for feature in features:
-            unique_id = f"{feature_type}_{feature.get('class', '')}"
+            base_id = f"{feature_type}_{feature.get('class', '')}"
             processed_feature = {"type": feature_type}
             
             if 'start' in feature and 'end' in feature: # Ramp-like features
@@ -109,15 +172,20 @@ def process_simulation_folder(folder_path, output_dir):
                     feature['end']['latitude'], feature['end']['longitude'], feature['end']['altitude']
                 )
                 processed_feature['w'] = feature.get('w', 0)
-                unique_id += f"_{feature.get('ry', 0)}_{feature.get('rz', 0)}"
+                base_id += f"_{feature.get('ry', 0)}_{feature.get('rz', 0)}"
 
             else: # Point-based features
                 processed_feature['center_ecef'] = get_ecef_from_wgs84(
                     feature['latitude'], feature['longitude'], feature['altitude']
                 )
                 processed_feature['r'] = feature.get('r', feature.get('l', 0)) # use r or l
-                unique_id += f"_{feature.get('r', feature.get('l', 0))}"
+                base_id += f"_{feature.get('r', feature.get('l', 0))}"
             
+            # Make the ID unique by appending a count
+            count = id_counts.get(base_id, 0) + 1
+            id_counts[base_id] = count
+            unique_id = f"{base_id}_{count}"
+
             processed_feature['id'] = unique_id
             map_features_ecef[feature_type].append(processed_feature)
 
@@ -129,7 +197,7 @@ def process_simulation_folder(folder_path, output_dir):
     expected_length = 0
     for filename in os.listdir(data_path):
         if filename.endswith(".json"):
-            with open(os.path.join(data_path, filename), 'r') as f:
+            with open(os.path.join(data_path, filename), 'r', encoding='utf-8') as f:
                  readings = json.load(f)
                  if readings.get('series'):
                      expected_length = len(readings['series'])
@@ -141,42 +209,23 @@ def process_simulation_folder(folder_path, output_dir):
 
     for filename in os.listdir(data_path):
         if filename.endswith(".json"):
-            with open(os.path.join(data_path, filename), 'r') as f:
+            with open(os.path.join(data_path, filename), 'r', encoding='utf-8') as f:
                 try:
                     readings = json.load(f)
-                    if not readings.get('series'):
+                    series = readings.get('series')
+                    if not series:
                         continue
                     
-                    dev_id = readings['series'][0]['dev']
+                    dev_id = series[0]['dev']
                     if dev_id in dev_to_name:
                         sensor_name = dev_to_name[dev_id]
-                        
-                        values = [r['value'] for r in readings['series']]
-                        
-                        # Pad or truncate to expected length
-                        if len(values) > expected_length:
-                            values = values[:expected_length]
-                        elif len(values) < expected_length:
-                            values.extend([np.nan] * (expected_length - len(values)))
-
-                        sensor_data[sensor_name] = values
+                        sensor_data[sensor_name] = _extract_and_pad_series(series, 'value', expected_length)
                         
                         # Special case for GPS: extract x, y, z
-                        if dev_id == 7: # GPS_X
-                            sensor_data['x'] = [r['x'] for r in readings['series']]
-                            sensor_data['y'] = [r['y'] for r in readings['series']]
-                            sensor_data['z'] = [r['z'] for r in readings['series']]
-                            
-                            if len(sensor_data['x']) > expected_length:
-                                sensor_data['x'] = sensor_data['x'][:expected_length]
-                                sensor_data['y'] = sensor_data['y'][:expected_length]
-                                sensor_data['z'] = sensor_data['z'][:expected_length]
-                            elif len(sensor_data['x']) < expected_length:
-                                pad_count = expected_length - len(sensor_data['x'])
-                                sensor_data['x'].extend([np.nan] * pad_count)
-                                sensor_data['y'].extend([np.nan] * pad_count)
-                                sensor_data['z'].extend([np.nan] * pad_count)
-
+                        if dev_id == DATA_MODEL["GPS_X"]:
+                            sensor_data['x'] = _extract_and_pad_series(series, 'x', expected_length)
+                            sensor_data['y'] = _extract_and_pad_series(series, 'y', expected_length)
+                            sensor_data['z'] = _extract_and_pad_series(series, 'z', expected_length)
 
                 except (json.JSONDecodeError, KeyError) as e:
                     print(f"Warning: Could not process {filename}. Error: {e}")
@@ -187,7 +236,7 @@ def process_simulation_folder(folder_path, output_dir):
         
     df = pd.DataFrame(sensor_data)
 
-    # 4. Data Transformation
+    # 4. Data Transformation and Cleaning
     # Fill NA values that may result from sensor series having different lengths
     df = df.fillna(method='ffill').fillna(method='bfill')
 
@@ -202,12 +251,15 @@ def process_simulation_folder(folder_path, output_dir):
         print(f"Skipping {folder_path}: No valid GPS data to determine context.")
         return
         
-    df['context'] = df.apply(lambda row: get_map_context([row['x'], row['y'], row['z']], map_features_ecef), axis=1)
+    df['context'] = df.apply(lambda row: get_map_context(row[['x', 'y', 'z']].tolist(), map_features_ecef), axis=1)
+
+    # Post-process context to glue together neighboring blocks
+    df = post_process_context(df)
 
     # 5. Save to CSV
     output_filename = f"simulation_{sim_id}_mass_{int(vehicle_mass)}_friction_{map_friction}.csv"
     output_path = os.path.join(output_dir, output_filename)
-    df.to_csv(output_path)
+    df.to_csv(output_path, index=False)
     print(f"Successfully created {output_path}")
 
 
@@ -215,16 +267,21 @@ def main():
     """
     Main function to find and process all simulation folders.
     """
-    base_dir = os.getcwd()
-    output_dir = os.path.join(base_dir, "processed_data")
+    project_root = os.getcwd()
+    input_dir = os.path.join(project_root, "json_data")
+    output_dir = os.path.join(project_root, "processed_data")
     
-    if not os.path.exists(output_dir):
-        os.makedirs(output_dir)
+    os.makedirs(output_dir, exist_ok=True)
+
+    if not os.path.exists(input_dir):
+        print(f"ERROR: Input directory not found at '{input_dir}'")
+        print("Please ensure the new data has been downloaded there.")
+        return
         
-    all_dirs = [d for d in os.listdir(base_dir) if os.path.isdir(d) and d.startswith("simulations")]
+    all_dirs = [d for d in os.listdir(input_dir) if os.path.isdir(os.path.join(input_dir, d)) and d.startswith("simulations")]
     
     for folder_name in sorted(all_dirs):
-        folder_path = os.path.join(base_dir, folder_name)
+        folder_path = os.path.join(input_dir, folder_name)
         try:
             process_simulation_folder(folder_path, output_dir)
         except Exception as e:

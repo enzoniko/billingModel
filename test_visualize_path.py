@@ -10,7 +10,7 @@ def main():
     Main function to visualize the vehicle path and map features in a top-down
     2D ECEF plot.
     """
-    SIMULATION_FOLDER = "simulations100"
+    SIMULATION_FOLDER = "simulations102"
     OUTPUT_FILENAME = "path_visualization.png"
 
     print(f"--- Creating Visualization for: {SIMULATION_FOLDER} ---")

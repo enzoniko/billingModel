@@ -69441,3 +69441,13 @@ Getting data from  IMU
 	got 64625  SmartData! Writing json to: ./simulations135/data/IMU_pitch.json
 	getting  roll_rate
 {'series': {'version': '1.2', 'unit': 3300014372, 't0': 1750732887859538, 't1': 1750734838459538, 'x': 0, 'y': 0, 'z': 0, 'r': 999999999, 'workflow': 0, 'dev': 38, 'signature': 42}, 'credentials': {'domain': 'sdav', 'username': 'sdavro', 'password': 'sd4vR@'}}
+	got 64913  SmartData! Writing json to: ./simulations135/data/IMU_roll_rate.json
+	getting  yaw_rate
+{'series': {'version': '1.2', 'unit': 3300014372, 't0': 1750732887859538, 't1': 1750734838459538, 'x': 0, 'y': 0, 'z': 0, 'r': 999999999, 'workflow': 0, 'dev': 36, 'signature': 42}, 'credentials': {'domain': 'sdav', 'username': 'sdavro', 'password': 'sd4vR@'}}
+	got 64913  SmartData! Writing json to: ./simulations135/data/IMU_yaw_rate.json
+	getting  pitch_rate
+{'series': {'version': '1.2', 'unit': 3300014372, 't0': 1750732887859538, 't1': 1750734838459538, 'x': 0, 'y': 0, 'z': 0, 'r': 999999999, 'workflow': 0, 'dev': 37, 'signature': 42}, 'credentials': {'domain': 'sdav', 'username': 'sdavro', 'password': 'sd4vR@'}}
+	got 64913  SmartData! Writing json to: ./simulations135/data/IMU_pitch_rate.json
+Getting data from  GNSS
+	getting  longitude
+{'series': {'version': '1.2', 'unit': 3300018468, 't0': 1750732887859538, 't1': 1750734838459538, 'x': 0, 'y': 0, 'z': 0, 'r': 999999999, 'workflow': 0, 'dev': 7, 'signature': 42}, 'credentials': {'domain': 'sdav', 'username': 'sdavro', 'password': 'sd4vR@'}}

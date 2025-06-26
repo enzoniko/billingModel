@@ -3,30 +3,39 @@
 import json
 import re
 import base64
+import pyproj
 import time
 import sys
 import struct
-import pandas as pd
-import pyproj
-from data_processor import (
-    parse_controle_txt,
-    get_entry_for_index,
-    get_entries_from_dirty_sniffer_log,
-    find_map_feature,
-    ecef_to_wgs84,
-    data_model,
-    parse_egos_ECEF_position
-)
+from smartdata import SmartData_IoT_Client, DB_Record, DB_Series, Unit
+from sniffer_cleaner import remove_content_after_pattern
 
 ''' Define constants '''
-LOG_PATH = "./log.txt"
-#clean log
+LOG_PATH="./log.txt"
+#clean log 
 with open(LOG_PATH, "w") as log_file:
     log_file.write("")
-DEBUG = True
+DEBUG = True, # Set to True for debugging, False for production -- enables printing debug messages
+# Devices that use relative motion vectors
+RELATIVE_MV_DEVICES = [20, 21, 22, 23] # CAMERA, LIDAR, RADAR, and FUSER
+ETSI_MV_DEVICES = [26,27,28] # ETSI motion vector devices
+EGO_CLASS = 12    # Class for ego motion vectors (unit.subtype)
 
+wgs84_to_ecef = pyproj.Transformer.from_crs(
+    {"proj":'latlong', "ellps":'WGS84', "datum":'WGS84'},
+    {"proj":'geocent', "ellps":'WGS84', "datum":'WGS84'},
+    )
+
+ecef_to_wgs84 = pyproj.Transformer.from_crs(
+    {"proj":'geocent', "ellps":'WGS84', "datum":'WGS84'},
+    {"proj":'latlong', "ellps":'WGS84', "datum":'WGS84'},
+    )
+
+''' Funtions'''
+
+# This function will print debug messages to the console if DEBUG is True
 def debug(*args):
-    if DEBUG:
+    if (DEBUG):
         print(*args)
     
     output = ' '.join(map(str, args))
@@ -34,262 +43,282 @@ def debug(*args):
     with open(LOG_PATH, "a") as log_file:
         log_file.write(output)
 
-def process_log_and_generate_csv(
-    sniffer_log_path,
-    controle_file_path,
-    map_features_path,
-    output_csv_path,
-    run_index,
-    is_time_step_fix=True,
-    ts_step=100000
-):
+def convert_to_valid_json(text):
+    # Replace single quotes with double quotes and ensure keys are double-quoted
+    text = text.replace("'", '"')
+    text = re.sub(r'(\w+)=', r'"\1":', text)
+    return text
+
+def get_entries_from_dirty_sniffer_log(file_path, save_path):
     """
-    Process a single log file and generate a CSV with mass, friction, and context columns.
-    Only includes sensors that are defined in the current data_model.
-    
-    Args:
-        sniffer_log_path: Path to the sniffer log file
-        controle_file_path: Path to controle.txt file
-        map_features_path: Path to map_features.json file
-        output_csv_path: Path for the output CSV file
-        run_index: Index of the current run
-        is_time_step_fix: Whether to use fixed time steps
-        ts_step: Time step value
-    
-    Returns:
-        bool: True if successful, False otherwise
+    Reads the sniffer log file and extracts entries based on the defined regex.
+    Returns a list of DB_Record objects.
     """
-    try:
-        with open(controle_file_path, 'r') as f:
-            controle_content = f.read()
-        controle_data = parse_controle_txt(controle_content)
-    except FileNotFoundError:
-        debug(f"Error: controle.txt not found at {controle_file_path}")
-        return False
+    # Regex to match each entry and extract values
+    ENTRY_REGEX = re.compile(
+        r"u=\{[^}]+\}=>"
+        r"(?P<u>\d+),"
+        r"d=(?P<d>\d+),"
+        r"t=(?P<t>\d+),"
+        r"sig=(?P<sig>\d+)\)?"
+        r"=\{(?P<v>[^\[\{]*?)(\[(?P<list_v>[^\]]*)\])?\}"
+    )
+    clean_sniffer = remove_content_after_pattern(file_path, save_path)
+    start_string = "Log Start:\n"
+    log_start = clean_sniffer.index(start_string)
 
-    try:
-        with open(map_features_path, 'r') as f:
-            map_features = json.load(f)
-    except FileNotFoundError:
-        debug(f"Error: map_features.json not found at {map_features_path}")
-        return False
+    clean_sniffer = clean_sniffer[log_start+len(start_string):]
+    entries = {}
+    for match in ENTRY_REGEX.finditer(clean_sniffer.replace(",\n\t]","\n\t]")):
+        if match.group("list_v"):
+            list_v = match.group("list_v").strip()
+            # Convert the string list to an actual list of dictionaries
+            list_v = convert_to_valid_json(f"[{list_v}]")
+            list_v = json.loads(list_v)
+            entry = DB_Record(unit=Unit(int(match.group("u"))), dev=int(match.group("d")), t=int(match.group("t")), signature=int(match.group("sig")), value=list_v)
+        else:
+            v = float(match.group("v")) if match.group("v").strip() else None
+            entry = DB_Record(unit=Unit(int(match.group("u"))), dev=int(match.group("d")), t=int(match.group("t")), signature=int(match.group("sig")), value=v)
+        if (not entry.signature in entries):
+            entries[entry.signature] = {}
+            debug("new sig=", entry.signature)
+        if (not entry.dev in entries[entry.signature]):
+            entries[entry.signature][entry.dev] = []
+            debug("new dev=", entry.dev)
+        entries[entry.signature][entry.dev].append(entry)
+    return entries
 
-    # Get run parameters (mass and friction)
-    run_params = get_entry_for_index(controle_data, run_index)
-    if not run_params:
-        debug(f"No control parameters found for run {run_index}")
-        return False
-
-    entries_by_sig = get_entries_from_dirty_sniffer_log(sniffer_log_path, 'data_small/clean_sniffer.log')
-    
-    if not entries_by_sig:
-        debug(f"No entries found in log file {sniffer_log_path}")
-        return False
-
-    csv_data = []
-    
-    # Create device ID to sensor name mapping only for active sensors
-    dev_to_name = {v: k for k, v in data_model.items()}
-    active_sensor_names = set(data_model.keys())
-    active_device_ids = set(data_model.values())
-    
-    debug(f"Active sensors: {sorted(active_sensor_names)}")
-    debug(f"Active device IDs: {sorted(active_device_ids)}")
-    
-    for signature, sig_entries in entries_by_sig.items():
-        debug(f"Processing signature {signature} for run {run_index}")
-
-        if 16 not in sig_entries:
-            debug(f"No ego motion vectors (dev=16) found for signature {signature}. Skipping.")
+def filter_ego_motion_vectors(entries):
+    return entries[16]
+    _e = []
+    for e in entries:
+        unit = e.unit
+        if (unit.si == 1):
             continue
-        
-        all_records = []
-        for records in sig_entries.values():
-            all_records.extend(records)
-        all_records.sort(key=lambda r: r.t)
+        else:
+            if (unit.subtype == EGO_CLASS):
+                _e.append(e)
+    return _e
 
-        egos = [r for r in all_records if r.dev == 16]
-        parse_egos_ECEF_position(egos, is_time_step_fix, ts_step, signature)
+def mv_to_bytes(mv):
+    byte_array = b''
+    byte_array += struct.pack('1f', mv['speed'])
+    byte_array += struct.pack('1f', mv['heading'])
+    byte_array += struct.pack('1f', mv['yawr'])
+    byte_array += struct.pack('1f', mv['accel'])
+    byte_array += struct.pack('Q', mv['id'])
+    return byte_array
 
-        # Initialize current state only for active sensors
-        current_state = {}
-        for sensor_name in active_sensor_names:
-            current_state[sensor_name] = None
+def relative_mv_to_bytes(mv, ego_speed, ego_heading, ego_yawr, ego_accel):
+    byte_array = b''
+    byte_array += struct.pack('1f', mv['speed'] + ego_speed)
+    byte_array += struct.pack('1f', mv['heading'] + ego_heading)
+    byte_array += struct.pack('1f', mv['yawr'] + ego_yawr)
+    byte_array += struct.pack('1f', mv['accel'] + ego_accel)
+    byte_array += struct.pack('Q', mv['id'])
+    return byte_array
 
-        for record in all_records:
-            # Only process records for active device IDs
-            if record.dev in active_device_ids and record.dev in dev_to_name:
-                dev_name = dev_to_name[record.dev]
-                if isinstance(record.value, list) and not record.value:
-                    current_state[dev_name] = None
-                else:
-                    current_state[dev_name] = record.value
-            elif record.dev not in [16] and record.dev not in active_device_ids:
-                # Log discarded devices (except dev=16 which is special)
-                debug(f"Discarding device {record.dev} (not in active data_model)")
+def convert_bytes_to_json_blob(bytes):
+    binstr = base64.b64encode(bytes)
+    aux = str(binstr)
+    return aux[2 : len(aux)-1]
 
-            if record.dev == 16:
-                row = {
-                    'timestamp': record.t,
-                    'run_index': run_index,
-                    'signature': signature,
-                    'mass': run_params['mass'],
-                    'friction': run_params['friction']
-                }
-                
-                # Only add active sensor data to the row
-                for sensor_name in active_sensor_names:
-                    row[sensor_name] = current_state[sensor_name]
+def get_ecef_position(ego_mv):
+    lon = int(ego_mv.value[0]['lon']) / 100000000.
+    lat = int(ego_mv.value[0]['lat']) / 100000000.
+    alt = int(ego_mv.value[0]['alt']) / 1000.
+    x, y, z = wgs84_to_ecef.transform(lat, lon, alt)
+    return x, y, z
 
-                if record.x and record.y and record.z:
-                    lat, lon, alt = ecef_to_wgs84.transform(record.x, record.y, record.z)
-                    row['lat'] = lat
-                    row['lon'] = lon
-                    row['alt'] = alt
-                    
-                    # Find map feature context
-                    map_feature = find_map_feature(lat, lon, map_features)
-                    row['context'] = map_feature if map_feature else 'road'
-                else:
-                    row['lat'] = None
-                    row['lon'] = None
-                    row['alt'] = None
-                    row['context'] = 'road'  # Default when no GPS coordinates
-                
-                vx = current_state.get("SPEED_X", 0) or 0
-                vy = current_state.get("SPEED_Y", 0) or 0
-                vz = current_state.get("SPEED_Z", 0) or 0
-                row['fused_speed'] = (vx**2 + vy**2 + vz**2)**0.5
-                
-                csv_data.append(row)
+def parse_egos_ECEF_position(egos, is_time_step_fix, ts_step, signature):
+    """
+    Parses DB_Record of mv and update the position in ECEF coordinates.
+    """
+    t0 = egos[0].t
+    for index, mv in enumerate(egos):
+        x, y, z = get_ecef_position(mv)
+        mv.x = x
+        mv.y = y
+        mv.z = z
+        if (is_time_step_fix):
+            mv.t = t0 + index * ts_step
+        mv.signature = signature
+    return egos
 
-        debug(f"Finished processing signature {signature} for run {run_index}")
+def find_latest_before(records, current_t):
+    """
+    Given a list of DB_Record elements, finds the one with the largest t less than current_t.
+    Returns a tuple (element, index) where element is the found record and index is its position in the records list.
+    Returns (records[0], 0) if no such record exists.
+    """
+    filtered = [(r, i) for i, r in enumerate(records) if r.t < current_t]
+    if not filtered:
+        return records[0], 0
+    return max(filtered, key=lambda x: x[0].t)
 
-    if csv_data:
-        df = pd.DataFrame(csv_data)
-        
-        # Define column order - only include active sensors
-        core_cols = ['timestamp', 'run_index', 'signature', 'mass', 'friction']
-        sensor_cols = sorted(active_sensor_names)  # Only active sensors
-        location_cols = ['lat', 'lon', 'alt', 'context', 'fused_speed']
-        
-        # Ensure all columns exist (but only for active sensors)
-        all_cols = core_cols + sensor_cols + location_cols
-        for col in all_cols:
-            if col not in df.columns:
-                df[col] = None
-        
-        # Order columns and save
-        df = df[all_cols]
-        df.to_csv(output_csv_path, index=False)
-        debug(f"Successfully generated {output_csv_path} with {len(df)} rows and {len(df.columns)} columns")
-        debug(f"Included sensor columns: {sensor_cols}")
-        return True
+def process_and_send_si_when_ego_is_available(sds, egos, IoT_Client, is_time_step_fix, ts_step, signature):
+    if (sds[0].unit.si != 1):
+        debug("process_and_send_si_when_ego_is_available for non-si unit=", sds[0].unit)
     else:
-        debug(f"No data collected for run {run_index}")
-        return False
+        t0 = sds[0].t
+        _, ego_index = find_latest_before(egos, t0)        
+        for index, e in enumerate(sds):
+            if is_time_step_fix:
+                e.t = t0 + index * ts_step
+            if (e.t > egos[ego_index].t and ego_index < len(egos) - 1 and e.t < egos[ego_index+1].t):
+                ego_index += 1
+            e.x = egos[ego_index].x
+            e.y = egos[ego_index].y
+            e.z = egos[ego_index].z
+            e.signature = signature
+        IoT_Client.send_with_retries(sds)
 
-def process_multiple_logs(
-    max_logs=None,
-    start_run=1,
-    end_run=220,
-    missing_runs=None,
-    output_dir="output_csvs",
-    controle_file_path='controle.txt',
-    map_features_path='map_features.json'
-):
-    """
-    Process multiple log files and generate individual CSV files for each.
-    Only includes sensors that are defined in the current data_model.
+def process_and_send_motion_vector_when_ego_is_available(sds, dev, egos, IoT_Client, is_time_step_fix, ts_step, signature):
+    if (sds[0].unit.si == 1 or sds[0].unit.multi != 1):
+        debug("process_and_send_motion_vector_list_when_ego_is_available for non-multi unit=", sds[0].unit,", dev=", dev)
+    else:
+        debug("process_and_send_motion_vector_list_when_ego_is_available for multi unit=", sds[0].unit,", dev=", dev, "with", len(sds), "entries")
+        records = []
+        t0 = sds[0].t
+        _, ego_index = find_latest_before(egos, t0)
+        for index, e in enumerate(sds):
+            if is_time_step_fix:
+                e.t = t0 + index * ts_step
+            if (e.t > egos[ego_index].t and ego_index < len(egos) - 1 and e.t < egos[ego_index+1].t):
+                ego_index += 1
+            # debug("entry[", index, "] with", len(e.value), "motion vectors")
+
+            for data in e.value: # for each motion vector in the list
+                mv = data # get dict of data
+                u = Unit.build_digital_unit(1, mv['class'], 0, 1) # # fix unit length as it is sent as a single motion vector
+                loc_lon = int(mv['lon'])/100000000.
+                loc_lat = int(mv['lat'])/100000000.
+                loc_alt = int(mv['alt'])/1000.
+                _x, _y, _z = wgs84_to_ecef.transform(loc_lon,loc_lat,loc_alt,radians = True)
+                if (dev not in RELATIVE_MV_DEVICES):
+                    binstr = mv_to_bytes(mv)
+                else:
+                    binstr = relative_mv_to_bytes(mv, float(egos[ego_index].value[0]["speed"]), 
+                                                  float (egos[ego_index].value[0]["heading"]), 
+                                                  float(egos[ego_index].value[0]["yawr"]), 
+                                                  float(egos[ego_index].value[0]["accel"]))
+                    _x=int(_x) + egos[ego_index].x,
+                    _y=int(_y) + egos[ego_index].y,
+                    _z=int(_z) + egos[ego_index].z,
+                v = convert_bytes_to_json_blob(binstr)
+                records.append(DB_Record(
+                    version=SmartData_IoT_Client.MOBILE,
+                    unit=u,
+                    value=v,
+                    x=int(_x),
+                    y=int(_y),
+                    z=int(_z),
+                    t=e.t,
+                    signature=signature,
+                    dev=dev
+                ))
+        if (len(records) == 0):
+            debug("No motion vectors found for device", dev)
+        else:
+            IoT_Client.send_with_retries(records)
+
+def process_and_send_ego_motion_vectors(mvs, IoT_Client):
+    for e in mvs:
+        mv = e.value[0]
+        binstr = mv_to_bytes(mv)
+        e.value = convert_bytes_to_json_blob(binstr)
+        e.unit = Unit.build_digital_unit(1, mv['class'], 0, 1)
+    if (len(mvs) > 0):
+        IoT_Client.send_with_retries(mvs)
+
+def process_and_send_ETSI_motion_vectors(mvs, IoT_Client, is_time_step_fix, ts_step):
+    t0 = mvs[0].t
+    for index, e in enumerate(mvs):
+        e.unit = Unit.build_digital_unit(1, mv['class'], 0, 1) # fix unit length as it is sent as a single motion vector
+        mv = e.value[0]
+        e.signature = mv["id"]
+        binstr = mv_to_bytes(mv)
+        e.value = convert_bytes_to_json_blob(binstr)
+        x, y, z = get_ecef_position(mv)
+        e.x = x
+        e.y = y
+        e.z = z
+        if (is_time_step_fix):
+            e.t = t0 + index * ts_step
+    if (len(mvs) > 0):
+        IoT_Client.send_with_retries(mvs)
+
+def parse_log_and_send(is_time_step_fix = True, # Set to True if the time step is fixed, False otherwise
+                       ts_step = 100000,  # Time step is 100 milliseconds
+                        # Paths for logs
+                        smartdata_log_path = '/home/lisha/sdav_integration/smartdata/logs/',
+                        sniffer_log_path = '/home/lisha/sdav_integration/smartdata/logs/sniffer.log',
+                        # Certificate paths + network host
+                        my_certificate = ('/home/lisha/sdav_integration/sdav_cert/sdav.pem', '/home/lisha/sdav_integration/sdav_cert/sdav.key'),
+                        host = 'deviot.setic.ufsc.br',
+                        buffer_max_len = 1000, # Maximum length of the buffer for SmartData_IoT_Client
+                        signature = 400   # default vehicle signature
+                        ):
     
-    Args:
-        max_logs: Maximum number of logs to process (None for all available)
-        start_run: Starting run number (default: 1)
-        end_run: Ending run number (default: 220)
-        missing_runs: List of run numbers to skip (default: [54, 55])
-        output_dir: Directory to save CSV files (default: "output_csvs")
-        controle_file_path: Path to controle.txt file
-        map_features_path: Path to map_features.json file
-    
-    Returns:
-        tuple: (success_count, total_attempts, output_files)
-    """
-    import os
-    
-    if missing_runs is None:
-        missing_runs = [54, 55]
-    
-    # Create output directory if it doesn't exist
-    if not os.path.exists(output_dir):
-        os.makedirs(output_dir)
-    
-    # Log which sensors are active
-    active_sensors = sorted(data_model.keys())
-    debug(f"Processing with active sensors: {active_sensors}")
-    debug(f"Total active sensors: {len(active_sensors)}")
-    
-    success_count = 0
-    total_attempts = 0
-    output_files = []
-    processed_runs = []
-    
-    for i in range(start_run, end_run + 1):
-        if max_logs and success_count >= max_logs:
-            debug(f"Reached maximum number of logs to process: {max_logs}")
-            break
-            
-        if i in missing_runs:
-            continue
-        
-        log_file_path = f'data_small/sniffer_run_{i}.log'
-        output_csv_path = f'{output_dir}/sniffer_run_{i}.csv'
-        total_attempts += 1
-        
-        # Check if the log file exists before processing
-        if not os.path.exists(log_file_path):
-            debug(f"Log file not found: {log_file_path}, skipping.")
+    #try:
+    entries = get_entries_from_dirty_sniffer_log(sniffer_log_path, smartdata_log_path)
+    #except Exception as e:
+    #    debug(f"An error occurred: {e}")
+    #    sys.exit(1)
+
+    veh_sig_list = [signature]
+
+    IoT_Client = SmartData_IoT_Client(
+        host=host,
+        my_certificate=my_certificate,
+        debug_mode=DEBUG,
+        log_path=LOG_PATH,
+        buffer_max_len=buffer_max_len
+    )
+
+    for sig in entries:
+        debug ("sig=", sig, "len=", len(entries[sig]))
+
+        egos = filter_ego_motion_vectors(entries[sig])
+        egos = parse_egos_ECEF_position(egos, is_time_step_fix, ts_step, signature)
+
+        if len(egos) == 0:
+            debug("No ego motion vectors found for signature", sig)
             continue
 
-        debug(f"Processing run {i}...")
-        try:
-            success = process_log_and_generate_csv(
-                sniffer_log_path=log_file_path,
-                controle_file_path=controle_file_path,
-                map_features_path=map_features_path,
-                output_csv_path=output_csv_path,
-                run_index=i
-            )
-            if success:
-                success_count += 1
-                processed_runs.append(i)
-                output_files.append(output_csv_path)
+        for d in entries[sig]:
+            if d == 16:
+                debug("Skipping device 16, we will send it later")
+                continue
+            if (d in ETSI_MV_DEVICES):
+                debug("Processing ETSI motion vector device", d, "with unit=", entries[sig][d][0].unit, "and signature=", entries[sig][d][0].value[0]["id"])
+                veh_sig_list.append(entries[sig][d][0].value[0]["id"])
+                process_and_send_ETSI_motion_vectors(entries[sig][d], IoT_Client, is_time_step_fix, ts_step)
+            if entries[sig][d][0].unit.si == 1:
+                debug("Processing si device = ", d, " with unit=", entries[sig][d][0].unit)
+                process_and_send_si_when_ego_is_available(entries[sig][d], egos, IoT_Client, is_time_step_fix, ts_step, signature)
             else:
-                debug(f"Failed to process run {i}")
-        except Exception as e:
-            debug(f"Error processing run {i}: {e}")
-            continue
-
-    debug(f"\nProcessing complete:")
-    debug(f"  - Successfully processed: {success_count} files")
-    debug(f"  - Total attempts: {total_attempts}")
-    debug(f"  - Processed runs: {processed_runs}")
-    debug(f"  - Output files: {len(output_files)}")
-    debug(f"  - Active sensors used: {len(active_sensors)}")
-    
-    print(f"Successfully processed {success_count} log files")
-    print(f"Generated {len(output_files)} CSV files in '{output_dir}' directory")
-    print(f"Using {len(active_sensors)} active sensors from data_model")
-    if processed_runs:
-        print(f"Processed runs: {processed_runs[:10]}{'...' if len(processed_runs) > 10 else ''}")
-    
-    return success_count, total_attempts, output_files
-
-# Legacy function for backward compatibility (but not used anymore)
-def reset_collected_data():
-    """Legacy function for backward compatibility - no longer needed"""
-    pass
+                debug("Processing non-si device = ", d, " with unit=", entries[sig][d][0].unit)
+                process_and_send_motion_vector_when_ego_is_available(entries[sig][d], d, egos, IoT_Client, is_time_step_fix, ts_step, signature)
+            
+        debug("Sending ego motion vectors for signature", sig)
+        process_and_send_ego_motion_vectors(egos, IoT_Client)
+        debug("Finished processing signature", sig)
 
 if __name__ == "__main__":
-    # Process all available log files, creating individual CSV files
-    process_multiple_logs()
+    # Example usage
+    missing = [54, 55]
+    for i in range(1, 221):
+        if (i in missing):
+            continue
+        parse_log_and_send(
+            is_time_step_fix=True,  # Set to True if the time step is fixed, False otherwise
+            ts_step=100000,  # Time step is 100 milliseconds
+            smartdata_log_path='data/',
+            sniffer_log_path='data/sniffer_run_'+str(i)+'.log',
+            my_certificate=('sdav_cert/sdav.pem', '/sdav_cert/sdav.key'),
+            host='deviot.setic.ufsc.br',
+            buffer_max_len=1000,  # Maximum length of the buffer for SmartData_IoT_Client
+            signature=400  # Default vehicle signature
+        )
 

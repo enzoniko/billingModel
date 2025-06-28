@@ -230,3 +230,5 @@ simulations220/
 
 json_data/
 *.png
+*.pth
+*.pkl

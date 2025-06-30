@@ -25,8 +25,9 @@ os.makedirs(RESULTS_DIR, exist_ok=True)
 # Model parameters
 WINDOW_SIZE = 30  # 3 seconds at 10Hz
 SENSORS_FOR_AUTOENCODER = [
-    'IMU_ACC_Z_DYNAMIC', 'IMU_ACC_X', 'IMU_ACC_Y', 
-    'ENGINE_RPM', 'SPEED', 'THROTTLE'
+    'BRAKE', 'DRAG', 'ENGINE_RPM', 'GEAR',
+    'IMU_ACC_X', 'IMU_ACC_Y', 'IMU_ACC_Z_DYNAMIC', 'PITCH', 'PITCH_RATE', 'ROLL_RATE', 'SPEED', 'STEER', 'THROTTLE',
+    'YAW', 'YAW_RATE'
 ]
 
 # Training parameters
@@ -238,7 +239,7 @@ class VehicleDataset(Dataset):
 class VehicleAutoencoder(nn.Module):
     """LSTM-based Autoencoder for vehicle sensor data."""
     
-    def __init__(self, input_size=6, hidden_sizes=[128, 64, 32], dropout=0.2):
+    def __init__(self, input_size=15, hidden_sizes=[128, 64, 32], dropout=0.2):
         super(VehicleAutoencoder, self).__init__()
         
         self.input_size = input_size
@@ -274,9 +275,28 @@ def train_autoencoder(train_loader: DataLoader, val_loader: DataLoader,
                      input_size: int, group_name: str) -> VehicleAutoencoder:
     """Train the autoencoder model."""
     device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
-    print(f"Training on device: {device}")
+    
+    # Enhanced CUDA information
+    if torch.cuda.is_available():
+        print(f"🚀 CUDA ENABLED - Training on GPU: {torch.cuda.get_device_name(0)}")
+        print(f"   GPU Memory: {torch.cuda.get_device_properties(0).total_memory / 1e9:.1f} GB")
+        print(f"   PyTorch Version: {torch.__version__}")
+        # Clear cache to ensure maximum memory availability
+        torch.cuda.empty_cache()
+    else:
+        print("⚠️  CUDA not available - Training on CPU (this will be slower)")
+    
+    print(f"Training device: {device}")
     
     model = VehicleAutoencoder(input_size=input_size).to(device)
+    
+    # Enable CUDA optimizations if available
+    if torch.cuda.is_available():
+        # Enable cuDNN benchmarking for consistent input sizes
+        torch.backends.cudnn.benchmark = True
+        # Enable mixed precision training for faster training (if supported)
+        print("🔧 CUDA optimizations enabled: cuDNN benchmark")
+    
     criterion = nn.MSELoss()
     optimizer = optim.Adam(model.parameters(), lr=LEARNING_RATE)
     scheduler = optim.lr_scheduler.ReduceLROnPlateau(optimizer, patience=10, factor=0.5)
@@ -375,7 +395,7 @@ def calculate_reconstruction_errors(model: VehicleAutoencoder, data_loader: Data
             mae_per_sensor = torch.mean(torch.abs(outputs - batch_x), dim=1)  # [batch, sensors]
             
             for i, sensor in enumerate(sensor_names):
-                all_errors[f"{sensor}_reconstruction_error"].extend(mae_per_sensor[:, i].cpu().numpy())
+                all_errors[f"{sensor}_reconstruction_error"].extend(mae_per_sensor[:, i].cpu().numpy().tolist())
     
     # Convert lists to numpy arrays
     for key in all_errors:
@@ -386,7 +406,7 @@ def calculate_reconstruction_errors(model: VehicleAutoencoder, data_loader: Data
 def main():
     parser = argparse.ArgumentParser(description="Train recurrent autoencoders for vehicle anomaly detection")
     parser.add_argument("--group", type=str, help="Specific group to train (e.g., 'group_1')")
-    parser.add_argument("--all", action="store_true", help="Train models for all groups")
+    parser.add_argument("--all", action="store_true", help="Train models for all groups", default=True)
     args = parser.parse_args()
     
     if not args.group and not args.all:

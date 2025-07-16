@@ -23,18 +23,6 @@ try:
 except ImportError:
     UMAP_AVAILABLE = False
     print("Warning: UMAP not available. Install with: pip install umap-learn")
-try:
-    from imblearn.over_sampling import SMOTE, BorderlineSMOTE, ADASYN
-    SMOTE_AVAILABLE = True
-except ImportError:
-    SMOTE_AVAILABLE = False
-    print("Warning: SMOTE not available. Install with: pip install imbalanced-learn")
-try:
-    from sklearn_extra.cluster import KMedoids
-    KMEDOIDS_AVAILABLE = True
-except ImportError:
-    KMEDOIDS_AVAILABLE = False
-    print("Warning: KMedoids not available. Install with: pip install scikit-learn-extra")
 import matplotlib.pyplot as plt
 import seaborn as sns
 import pywt
@@ -47,12 +35,10 @@ from recurrent_autoencoder_anomaly_detection import VehicleAutoencoder, SENSORS_
 
 # Paths
 PROCESSED_DATA_DIR = "processed_data"
-RESULTS_DIR = "results_experiment2"
+RESULTS_DIR = "results_experiment2_old"
 MODELS_DIR = "autoencoder_models"
 AUTOENCODER_RESULTS_DIR = "autoencoder_results"
-ERROR_CACHE_DIR = "reconstruction_error_cache"
 os.makedirs(RESULTS_DIR, exist_ok=True)
-os.makedirs(ERROR_CACHE_DIR, exist_ok=True)
 
 # Experiment Parameters
 FIXED_WINDOW_SIZE = 30
@@ -72,39 +58,22 @@ DIMENSIONALITY_REDUCTION = {
 
 # Enhanced Pricing Strategy Configuration
 PRICING_STRATEGY = {
-    'method': 'exponential_weighting',  # Options: 'weighted_average', 'hard_assignment', 'threshold_assignment', 'exponential_weighting'
+    'method': 'threshold_assignment',  # Options: 'weighted_average', 'hard_assignment', 'threshold_assignment', 'exponential_weighting'
     'threshold_distance': 0.8,        # For threshold_assignment: relative closeness threshold (0.8 = 80% closer)
     'exponential_power': 3.0,         # For exponential_weighting: power for exponential decay
     'min_weight_threshold': 0.01      # Minimum weight threshold to ignore very distant centroids
 }
 
-# Class Imbalance and Distance Metric Improvements Configuration
-IMPROVEMENTS_CONFIG = {
-    'use_smote': False,                 # Enable SMOTE oversampling to balance classes
-    'smote_method': 'SMOTE',          # Options: 'SMOTE', 'BorderlineSMOTE', 'ADASYN'
-    'smote_k_neighbors': 5,           # Number of neighbors for SMOTE
-    'smote_min_class_size': 6,        # Minimum class size required for SMOTE (k_neighbors + 1)
-    'use_mahalanobis': False,          # Use Mahalanobis distance instead of Euclidean
-    'mahalanobis_regularization': 1e-6,  # Regularization for singular covariance matrices
-    'use_label_efficient_balancing': True,  # Use label-efficient balancing for small datasets
-    'class_weighting': 'balanced'     # Options: 'balanced', 'manual', None
-}
-
 # Train/Validation Split Configuration
 TRAIN_VALIDATION_SPLIT = 0.7  # 70% for training, 30% for validation
 
-# Fast Validation Configuration
-FAST_VALIDATION = {
-    'enabled': True,                   # Enable fast validation mode
-    'max_train_files': 5,             # Maximum training files to process per group
-    'max_val_files': 3,               # Maximum validation files to process per group
-    'max_windows_per_file': 100,      # Maximum windows to process per file
-    'skip_plots': False,              # Skip individual simulation plots (keep group summaries)
-    'reduced_features': False         # Use reduced feature set for speed
-}
+# Method Selection Configuration - kmeans + baseline
+METHODS_TO_RUN = ['kmeans', 'baseline', 'hybrid']  # kmeans + baseline method
 
-# Method Selection Configuration
-METHODS_TO_RUN = ['kmedoids', 'kmeans', 'baseline']
+# Hybrid combination parameters
+HYBRID_PARAMS = {
+    'alpha': 0.3  # incentive factor (0 = pure masking, >0 boosts peaks)
+}
 
 # Enhanced Feature Parameters
 WAVELET_TYPE = 'morl'  # Morlet wavelet
@@ -239,99 +208,52 @@ def process_data_for_autoencoder(df: pd.DataFrame) -> pd.DataFrame:
     
     return df
 
-def get_or_generate_error_windows(
-    csv_file: str, 
-    model: VehicleAutoencoder, 
-    scaler: MinMaxScaler, 
-    group_name: str, 
-    window_size: int = WINDOW_SIZE
-) -> Tuple[Optional[np.ndarray], Optional[List[str]]]:
-    """
-    Generates or loads cached reconstruction error windows for a given simulation file.
-    The error is the absolute difference between the normalized original window and the 
-    autoencoder's reconstruction.
-    """
-    sim_id_match = re.search(r'simulation_(\d+)_', os.path.basename(csv_file))
-    if not sim_id_match:
-        print(f"Warning: Could not determine sim_id for {csv_file}. Skipping cache.")
-        return None, None
-    sim_id = sim_id_match.group(1)
-
-    # Define cache path
-    cache_path = os.path.join(ERROR_CACHE_DIR, f"{group_name}_sim_{sim_id}_error_windows.pkl")
-
-    # Try to load from cache
-    if os.path.exists(cache_path):
-        print(f"  Loading cached error windows for sim {sim_id}...")
-        try:
-            with open(cache_path, 'rb') as f:
-                return pickle.load(f)
-        except Exception as e:
-            print(f"    Warning: Could not load cache file {cache_path}. Regenerating. Error: {e}")
-
-    print(f"  Generating error windows for sim {sim_id} (cache not found)...")
+def generate_reconstruction_error_signals(df: pd.DataFrame, model: VehicleAutoencoder, 
+                                        scaler: MinMaxScaler) -> pd.DataFrame:
+    """Generate reconstruction error signals for the entire simulation."""
+    device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
     
-    try:
-        df = pd.read_csv(csv_file)
-        # Preprocess (crash detection, etc.)
-        df = process_data_for_autoencoder(df)
+    # Check if all required sensors are available
+    available_sensors = [sensor for sensor in SENSORS_FOR_AUTOENCODER if sensor in df.columns]
+    if len(available_sensors) < len(SENSORS_FOR_AUTOENCODER):
+        missing = set(SENSORS_FOR_AUTOENCODER) - set(available_sensors)
+        raise ValueError(f"Missing required sensors: {missing}")
+    
+    # Extract sensor data
+    sensor_data = df[SENSORS_FOR_AUTOENCODER].values
+    
+    # Initialize reconstruction error arrays
+    reconstruction_errors = np.full((len(df), len(SENSORS_FOR_AUTOENCODER)), np.nan)
+    
+    # Process data in sliding windows
+    for i in range(len(df) - WINDOW_SIZE + 1):
+        window_data = sensor_data[i:i + WINDOW_SIZE]
         
-        # Check if all required sensors are available
-        available_sensors = [sensor for sensor in SENSORS_FOR_AUTOENCODER if sensor in df.columns]
-        if len(available_sensors) < len(SENSORS_FOR_AUTOENCODER):
-            missing = set(SENSORS_FOR_AUTOENCODER) - set(available_sensors)
-            print(f"    Warning: Missing sensors in {csv_file}: {missing}. Skipping.")
-            return None, None
-            
-        sensor_data = np.array(df[SENSORS_FOR_AUTOENCODER].values)
+        # Normalize window
+        window_normalized = scaler.transform(window_data)
         
-        # Create non-overlapping windows from the raw sensor data
-        num_timestamps = sensor_data.shape[0]
-        num_windows = num_timestamps // window_size
-        if num_windows == 0:
-            return None, None
-            
-        # Reshape data into windows
-        # Shape: (num_windows, window_size, num_features)
-        raw_windows = sensor_data[:num_windows * window_size].reshape(num_windows, window_size, -1)
+        # Convert to tensor
+        window_tensor = torch.FloatTensor(window_normalized).unsqueeze(0).to(device)  # [1, window_size, sensors]
         
-        # Get context for each window
-        context_col = 'CONTEXT' if 'CONTEXT' in df.columns else 'context'
-        window_contexts = [
-            assign_context_to_fixed_window(df.iloc[i * window_size:(i + 1) * window_size][context_col].values, 'majority_expensive')
-            for i in range(num_windows)
-        ]
-
-        error_windows = np.zeros_like(raw_windows, dtype=np.float32)
-        device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
-
-        # Process each window
-        for i in range(num_windows):
-            window_raw = raw_windows[i]
-            
-            # Normalize window
-            window_normalized = scaler.transform(window_raw)
-            
-            # Convert to tensor
-            window_tensor = torch.FloatTensor(window_normalized).unsqueeze(0).to(device)
-            
-            # Get reconstruction
-            with torch.no_grad():
-                reconstructed_tensor = model(window_tensor)
-            
-            # Calculate error window (abs difference on normalized data)
-            error_window = torch.abs(reconstructed_tensor - window_tensor).squeeze(0).cpu().numpy()
-            error_windows[i] = error_window
-
-        # Cache the results
-        with open(cache_path, 'wb') as f:
-            pickle.dump((error_windows, window_contexts), f)
-            
-        return error_windows, window_contexts
-
-    except Exception as e:
-        print(f"    Error processing {csv_file}: {e}")
-        return None, None
+        # Get reconstruction
+        with torch.no_grad():
+            reconstructed = model(window_tensor)
+        
+        # Calculate errors for this window (MAE per sensor per timestep)
+        original_tensor = window_tensor
+        errors = torch.abs(reconstructed - original_tensor).squeeze(0).cpu().numpy()  # [window_size, sensors]
+        
+        # Assign errors to the corresponding positions (using the middle of the window)
+        middle_idx = i + WINDOW_SIZE // 2
+        if middle_idx < len(reconstruction_errors):
+            reconstruction_errors[middle_idx] = errors[WINDOW_SIZE // 2]  # Use middle timestep of window
+    
+    # Create new dataframe with reconstruction error signals
+    df_with_errors = df.copy()
+    for j, sensor in enumerate(SENSORS_FOR_AUTOENCODER):
+        df_with_errors[f"{sensor}_reconstruction_error"] = reconstruction_errors[:, j]
+    
+    return df_with_errors 
 
 # --- Enhanced Feature Extraction Functions ---
 
@@ -592,6 +514,14 @@ def intelligent_pca_reduction(features: np.ndarray, target_variance: float = 0.9
     n_samples, n_features = features.shape
     max_possible = min(int(n_samples - 1), int(n_features), max_components)
     
+    if max_possible < 1:
+        # Not enough data to reduce, return a dummy object that does nothing
+        print("  Warning: Not enough samples to perform PCA. Returning dummy reducer.")
+        class DummyPCAReducer:
+            def fit(self, X: np.ndarray) -> 'DummyPCAReducer': return self
+            def transform(self, X: np.ndarray) -> np.ndarray: return X if isinstance(X, np.ndarray) else np.array(X)
+        return DummyPCAReducer(), features.shape[1] # type: ignore
+
     # Fit PCA with maximum possible components
     pca_full = PCA(n_components=max_possible)
     pca_full.fit(features)
@@ -602,7 +532,13 @@ def intelligent_pca_reduction(features: np.ndarray, target_variance: float = 0.9
     # Find number of components needed for target variance - FIX TYPE ISSUES
     component_idx = np.argmax(cumsum_variance >= target_variance)
     n_components = int(component_idx) + 1  # Convert to Python int explicitly
+    
+    # If variance target is not met, argmax returns 0. Check if we should use all components.
+    if cumsum_variance[-1] < target_variance:
+        n_components = max_possible
+
     n_components = max(min_components, min(n_components, max_components))
+    n_components = min(n_components, max_possible) # Ensure we don't exceed what's possible
     
     print(f"  Intelligent PCA: {n_components} components retain {cumsum_variance[n_components-1]:.3f} variance")
     print(f"  Reduction: {n_features} → {n_components} features ({100*(1-n_components/n_features):.1f}% reduction)")
@@ -784,154 +720,6 @@ def apply_dimensionality_reduction(features: np.ndarray, labels: Optional[list] 
     
     return reduced_features, reducer
 
-def apply_smote_balancing(features: np.ndarray, labels: list, config: dict) -> Tuple[np.ndarray, list]:
-    """
-    Apply SMOTE oversampling to balance class distributions with label-efficient handling.
-    
-    Args:
-        features: Feature matrix to balance
-        labels: Context labels for each sample
-        config: SMOTE configuration dictionary
-        
-    Returns:
-        Tuple of (balanced_features, balanced_labels)
-    """
-    if not config.get('use_smote', False):
-        return features, labels
-    
-    # Count original class distribution
-    from collections import Counter
-    original_counts = Counter(labels)
-    print(f"  Original class distribution: {dict(original_counts)}")
-    
-    # Check minimum class size requirement
-    min_class_size = min(original_counts.values())
-    required_min_size = config.get('smote_min_class_size', 6)
-    
-    if min_class_size < required_min_size:
-        print(f"  Warning: Smallest class has only {min_class_size} samples, but SMOTE requires {required_min_size}.")
-        
-        # Use label-efficient balancing if enabled
-        if config.get('use_label_efficient_balancing', True):
-            print("  Applying label-efficient balancing instead of SMOTE...")
-            return apply_label_efficient_balancing(features, labels, config)
-        else:
-            print("  Skipping class balancing due to insufficient samples.")
-            return features, labels
-    
-    # Apply SMOTE if we have enough samples
-    if not SMOTE_AVAILABLE:
-        print("  Warning: SMOTE not available. Trying label-efficient balancing...")
-        if config.get('use_label_efficient_balancing', True):
-            return apply_label_efficient_balancing(features, labels, config)
-        return features, labels
-    
-    print(f"  Applying {config['smote_method']} class balancing...")
-    
-    # Determine k_neighbors parameter
-    k_neighbors = min(config['smote_k_neighbors'], min_class_size - 1)
-    
-    # Apply SMOTE
-    try:
-        if config['smote_method'] == 'SMOTE':
-            smote = SMOTE(random_state=42, k_neighbors=k_neighbors)
-        elif config['smote_method'] == 'BorderlineSMOTE':
-            smote = BorderlineSMOTE(random_state=42, k_neighbors=k_neighbors)
-        elif config['smote_method'] == 'ADASYN':
-            smote = ADASYN(random_state=42, n_neighbors=k_neighbors)
-        else:
-            print(f"  Warning: Unknown SMOTE method '{config['smote_method']}'. Using default SMOTE.")
-            smote = SMOTE(random_state=42, k_neighbors=k_neighbors)
-        
-        smote_result = smote.fit_resample(features, labels)
-        balanced_features, balanced_labels_array = smote_result[0], smote_result[1]
-        
-        # Ensure output is properly typed
-        if not isinstance(balanced_features, np.ndarray):
-            balanced_features = np.array(balanced_features)
-        
-        # Report new class distribution
-        balanced_labels = balanced_labels_array.tolist() if hasattr(balanced_labels_array, 'tolist') else list(balanced_labels_array)
-        balanced_counts = Counter(balanced_labels)
-        print(f"  Balanced class distribution: {dict(balanced_counts)}")
-        print(f"  Total samples: {len(labels)} → {len(balanced_labels)}")
-        
-        return balanced_features, balanced_labels
-        
-    except Exception as e:
-        print(f"  Error applying SMOTE: {e}")
-        print("  Trying label-efficient balancing...")
-        if config.get('use_label_efficient_balancing', True):
-            return apply_label_efficient_balancing(features, labels, config)
-        return features, labels
-
-def apply_label_efficient_balancing(features: np.ndarray, labels: list, config: dict) -> Tuple[np.ndarray, list]:
-    """
-    Apply label-efficient balancing for small datasets where SMOTE isn't applicable.
-    
-    This method works well with just one representative sample per class by using:
-    1. Weighted sampling based on class frequency
-    2. Gaussian noise augmentation for minority classes
-    3. Class-weighted clustering initialization
-    
-    Args:
-        features: Feature matrix to balance
-        labels: Context labels for each sample
-        config: Configuration dictionary
-        
-    Returns:
-        Tuple of (balanced_features, balanced_labels)
-    """
-    from collections import Counter
-    
-    original_counts = Counter(labels)
-    print(f"  Label-efficient balancing: {dict(original_counts)}")
-    
-    # Find the maximum class size
-    max_class_size = max(original_counts.values())
-    
-    # Create balanced dataset by augmenting minority classes
-    balanced_features = []
-    balanced_labels = []
-    
-    for class_label, count in original_counts.items():
-        # Get all samples for this class
-        class_indices = [i for i, label in enumerate(labels) if label == class_label]
-        class_features = features[class_indices]
-        
-        # Add original samples
-        balanced_features.extend(class_features)
-        balanced_labels.extend([class_label] * len(class_features))
-        
-        # If this class needs augmentation
-        if count < max_class_size:
-            samples_needed = max_class_size - count
-            print(f"    Augmenting class '{class_label}': {count} → {max_class_size} samples")
-            
-            # Generate augmented samples using Gaussian noise
-            for _ in range(samples_needed):
-                # Select a random sample from this class
-                base_sample = class_features[np.random.randint(0, len(class_features))]
-                
-                # Add small amount of Gaussian noise (1% of feature std)
-                noise_scale = 0.01 * np.std(class_features, axis=0)
-                noise_scale = np.where(noise_scale == 0, 0.01, noise_scale)  # Avoid zero std
-                noise = np.random.normal(0, noise_scale, size=base_sample.shape)
-                
-                augmented_sample = base_sample + noise
-                balanced_features.append(augmented_sample)
-                balanced_labels.append(class_label)
-    
-    # Convert to numpy array
-    balanced_features = np.array(balanced_features)
-    
-    # Report results
-    balanced_counts = Counter(balanced_labels)
-    print(f"  Label-efficient balanced distribution: {dict(balanced_counts)}")
-    print(f"  Total samples: {len(labels)} → {len(balanced_labels)}")
-    
-    return balanced_features, balanced_labels
-
 def transform_new_features(features: np.ndarray, reducer: Union[object, Tuple], method: str) -> np.ndarray:
     """
     Transform new features using a fitted dimensionality reducer.
@@ -954,9 +742,9 @@ def transform_new_features(features: np.ndarray, reducer: Union[object, Tuple], 
             raise ValueError("Hybrid method requires tuple of (selector, pca_reducer)")
     else:
         # For other methods, reducer is a single object with transform method
-        try:
-            transformed = reducer.transform(features)  # type: ignore
-        except AttributeError:
+        if hasattr(reducer, 'transform'):
+            transformed = reducer.transform(features)
+        else:
             raise ValueError(f"Reducer for method '{method}' does not have transform method")
     
     # Ensure output is always numpy array
@@ -1307,6 +1095,47 @@ def create_fixed_windows_with_most_expensive_context(df: pd.DataFrame, error_col
     print(f"  Created {len(windows)} evaluation windows with context distribution: {dict(Counter(contexts))}")
     return windows, contexts
 
+def create_fixed_windows_for_training(df: pd.DataFrame, error_cols: list,
+                                      window_size: int = FIXED_WINDOW_SIZE,
+                                      context_col: str = 'context') -> Tuple[List[np.ndarray], List[str]]:
+    """
+    Creates fixed-size windows from training data and assigns a context using the 'majority_expensive' strategy.
+    
+    Args:
+        df: DataFrame with reconstruction error signals and context information.
+        error_cols: List of reconstruction error column names.
+        window_size: Size of fixed windows.
+        context_col: Name of context column.
+    
+    Returns:
+        Tuple of (windows_list, context_labels_list).
+    """
+    windows = []
+    contexts = []
+    
+    if df.empty or context_col not in df.columns:
+        return windows, contexts
+    
+    num_windows = len(df) // window_size
+    print(f"  Extracting all {num_windows} possible windows from training data...")
+    
+    for i in range(num_windows):
+        start_idx = i * window_size
+        end_idx = (i + 1) * window_size
+        
+        window_df = df.iloc[start_idx:end_idx]
+        window_data = window_df[error_cols].values
+        window_contexts = window_df[context_col].values
+        
+        # Use majority_expensive strategy for a more robust label
+        window_context = assign_context_to_fixed_window(window_contexts, 'majority_expensive')
+        
+        windows.append(window_data)
+        contexts.append(window_context)
+        
+    print(f"  Extracted {len(windows)} windows with context distribution: {dict(Counter(contexts))}")
+    return windows, contexts
+
 def get_generic_context(specific_context: str) -> str:
     """Strips unique IDs from context strings (e.g., ramp_..._1 -> ramp_...)."""
     if not isinstance(specific_context, str): return "unknown"
@@ -1315,91 +1144,6 @@ def get_generic_context(specific_context: str) -> str:
     if match:
         return specific_context[:match.start()]
     return specific_context
-
-def handle_single_element_clusters(centroids: np.ndarray, labels: np.ndarray, 
-                                  features: np.ndarray, min_cluster_size: int = 2,
-                                  is_kmedoids: bool = False) -> Tuple[np.ndarray, np.ndarray]:
-    """
-    Handle clusters with only one element by merging them with the nearest cluster.
-    
-    Args:
-        centroids: Cluster centroids
-        labels: Cluster labels for each sample
-        features: Feature matrix
-        min_cluster_size: Minimum required cluster size
-        is_kmedoids: Flag to indicate if the model is KMedoids
-        
-    Returns:
-        Tuple of (updated_centroids, updated_labels)
-    """
-    from collections import Counter
-    
-    # Count samples per cluster
-    cluster_counts = Counter(labels)
-    small_clusters = [cluster_id for cluster_id, count in cluster_counts.items() if count < min_cluster_size]
-    
-    if not small_clusters:
-        return centroids, labels
-    
-    print(f"  Found {len(small_clusters)} clusters with < {min_cluster_size} samples: {small_clusters}")
-    
-    # For each small cluster, find the nearest larger cluster
-    updated_labels = labels.copy()
-    
-    for small_cluster_id in small_clusters:
-        # Find the nearest larger cluster
-        small_cluster_centroid = centroids[small_cluster_id]
-        
-        # Calculate distances to all other clusters
-        distances = []
-        valid_clusters = []
-        for other_cluster_id in range(len(centroids)):
-            if other_cluster_id != small_cluster_id and cluster_counts[other_cluster_id] >= min_cluster_size:
-                distance = np.linalg.norm(centroids[other_cluster_id] - small_cluster_centroid)
-                distances.append(distance)
-                valid_clusters.append(other_cluster_id)
-        
-        if valid_clusters:
-            # Merge with the nearest valid cluster
-            nearest_cluster_id = valid_clusters[np.argmin(distances)]
-            
-            # Update labels
-            updated_labels[updated_labels == small_cluster_id] = nearest_cluster_id
-            
-            print(f"    Merged cluster {small_cluster_id} ({cluster_counts[small_cluster_id]} samples) into cluster {nearest_cluster_id}")
-        else:
-            print(f"    Warning: No valid clusters to merge cluster {small_cluster_id} into")
-    
-    # Update centroids by recalculating for merged clusters
-    unique_labels = np.unique(updated_labels)
-    updated_centroids = np.zeros((len(unique_labels), centroids.shape[1]))
-    
-    for i, label in enumerate(unique_labels):
-        cluster_features = features[updated_labels == label]
-        if is_kmedoids:
-            # For KMedoids, the new centroid must be a point in the cluster (the medoid).
-            # We find the point that has the minimum sum of distances to all other points in the cluster.
-            from sklearn.metrics import pairwise_distances
-            if cluster_features.shape[0] > 0:
-                distances = pairwise_distances(cluster_features, metric='euclidean')
-                medoid_idx = np.argmin(np.sum(distances, axis=1))
-                updated_centroids[i] = cluster_features[medoid_idx]
-            else:
-                # This case should not happen if logic is correct, but as a fallback:
-                # We can't find a medoid, so we keep the old centroid for the corresponding label if possible.
-                # This is complex, so we'll just use a zero vector as a placeholder.
-                updated_centroids[i] = np.zeros(centroids.shape[1])
-        else:
-            # For KMeans, the centroid is the mean of the cluster points.
-            updated_centroids[i] = np.mean(cluster_features, axis=0)
-    
-    # Create label mapping to ensure consecutive labeling
-    label_mapping = {old_label: new_label for new_label, old_label in enumerate(unique_labels)}
-    final_labels = np.array([label_mapping[label] for label in updated_labels])
-    
-    print(f"  Final clusters: {len(updated_centroids)} (reduced from {len(centroids)})")
-    
-    return updated_centroids, final_labels
 
 def calculate_baseline_prices(fixed_windows: np.ndarray) -> np.ndarray:
     """
@@ -1438,114 +1182,70 @@ def calculate_baseline_prices(fixed_windows: np.ndarray) -> np.ndarray:
 
 # --- Steps 3 & 4: Billing and Ground Truth Calculation ---
 
-def compute_cluster_covariances(features: np.ndarray, labels: np.ndarray, centroids: np.ndarray, 
-                               regularization: float = 1e-6) -> np.ndarray:
-    """
-    Compute inverse covariance matrices for each cluster for Mahalanobis distance.
-    
-    Args:
-        features: Feature matrix used for clustering
-        labels: Cluster assignments for each sample
-        centroids: Cluster centroids
-        regularization: Regularization parameter for singular matrices
-        
-    Returns:
-        Array of inverse covariance matrices (n_clusters, n_features, n_features)
-    """
-    n_clusters, n_features = centroids.shape
-    inv_covs = np.zeros((n_clusters, n_features, n_features))
-    
-    for i in range(n_clusters):
-        # Get members of this cluster
-        cluster_mask = labels == i
-        cluster_members = features[cluster_mask]
-        
-        if len(cluster_members) < 2:
-            # Not enough samples for covariance - use identity matrix
-            print(f"    Warning: Cluster {i} has only {len(cluster_members)} samples. Using identity covariance.")
-            inv_covs[i] = np.eye(n_features) / regularization
-        else:
-            # Compute covariance matrix with regularization
-            cov_matrix = np.cov(cluster_members, rowvar=False)
-            
-            # Add regularization to diagonal for numerical stability
-            cov_matrix += regularization * np.eye(n_features)
-            
-            try:
-                inv_covs[i] = np.linalg.inv(cov_matrix)
-            except np.linalg.LinAlgError:
-                print(f"    Warning: Singular covariance matrix for cluster {i}. Using regularized identity.")
-                inv_covs[i] = np.eye(n_features) / regularization
-    
-    return inv_covs
-
-def calculate_mahalanobis_distances(features: np.ndarray, centroids: np.ndarray, 
-                                   inv_covs: np.ndarray) -> np.ndarray:
-    """
-    Calculate Mahalanobis distances from features to centroids.
-    
-    Args:
-        features: Feature matrix (n_samples, n_features)
-        centroids: Cluster centroids (n_clusters, n_features)
-        inv_covs: Inverse covariance matrices (n_clusters, n_features, n_features)
-        
-    Returns:
-        Distance matrix (n_samples, n_clusters)
-    """
-    n_samples, n_features = features.shape
-    n_clusters = centroids.shape[0]
-    distances = np.zeros((n_samples, n_clusters))
-    
-    for i in range(n_clusters):
-        # Compute differences
-        diff = features - centroids[i]  # (n_samples, n_features)
-        
-        # Apply inverse covariance: diff @ inv_cov @ diff.T
-        # Using einsum for efficiency: 'ij,jk,ik->i'
-        mahal_sq = np.einsum('ij,jk,ik->i', diff, inv_covs[i], diff)
-        
-        # Take square root for Mahalanobis distance
-        distances[:, i] = np.sqrt(np.maximum(mahal_sq, 0))  # Ensure non-negative
-    
-    return distances
-
-def calculate_cluster_prices(
+def calculate_prices(
     fixed_windows: np.ndarray,
     centroid_prices: np.ndarray,
-    final_centroids: np.ndarray,
+    final_kmeans_centroids: np.ndarray,
     scaler_kmeans: StandardScaler,
-    dimensionality_reducer: object,
-    reduction_method: str,
-    inv_covs: Optional[np.ndarray] = None
-) -> np.ndarray:
-    """Calculates prices for fixed-size windows for a single clustering model."""
+    pricing_strategy_config: dict,
+    hybrid_config: dict,
+    post_process_config: dict
+) -> dict:
+    """Calculates prices for fixed-size windows using all requested methods."""
     if fixed_windows.shape[0] == 0:
-        return np.array([])
+        return {}
 
-    # Extract features and apply same preprocessing pipeline
-    fixed_windows_features = extract_enhanced_features_from_reconstruction_errors(fixed_windows)
-    scaled_features = np.array(scaler_kmeans.transform(fixed_windows_features))
-    reduced_features = transform_new_features(scaled_features, dimensionality_reducer, reduction_method)
-    
-    # Calculate distances to centroids
-    if IMPROVEMENTS_CONFIG.get('use_mahalanobis', False) and inv_covs is not None:
-        # Use Mahalanobis distance with pre-computed cluster covariances
-        # print("    Using Mahalanobis distance for price calculation...")
-        distances = calculate_mahalanobis_distances(reduced_features, final_centroids, inv_covs)
-    else:
-        # Use standard Euclidean distance
-        distances = np.linalg.norm(reduced_features[:, np.newaxis, :] - final_centroids, axis=2)
-    
-    # Apply enhanced pricing strategy
-    calculated_prices = calculate_prices_with_strategy(
-        distances, 
-        centroid_prices,
-        strategy=PRICING_STRATEGY['method'],
-        threshold_distance=PRICING_STRATEGY['threshold_distance'],
-        exponential_power=PRICING_STRATEGY['exponential_power'],
-        min_weight_threshold=PRICING_STRATEGY['min_weight_threshold']
-    )
-    return calculated_prices
+    results: Dict[str, np.ndarray] = {}
+    kmeans_prices, baseline_prices = None, None
+
+    # --- Feature Extraction (common for kmeans and hybrid) ---
+    if any(m in METHODS_TO_RUN for m in ['kmeans', 'hybrid']):
+        fixed_windows_features = extract_enhanced_features_from_reconstruction_errors(fixed_windows)
+        assert isinstance(fixed_windows_features, np.ndarray)
+        # Features for kmeans are now the scaled, high-dimensional features
+        features_for_kmeans = scaler_kmeans.transform(fixed_windows_features)
+        assert isinstance(features_for_kmeans, np.ndarray)
+
+    # --- K-Means prices (needed for 'kmeans' and 'hybrid') ---
+    if 'kmeans' in METHODS_TO_RUN or 'hybrid' in METHODS_TO_RUN:
+        # Calculate distances in the high-dimensional space
+        kmeans_distances = np.linalg.norm(features_for_kmeans[:, np.newaxis, :] - final_kmeans_centroids, axis=2)
+        
+        kmeans_prices = calculate_prices_with_strategy(
+            kmeans_distances, centroid_prices,
+            strategy=pricing_strategy_config['method'],
+            threshold_distance=pricing_strategy_config['threshold_distance'],
+            exponential_power=pricing_strategy_config['exponential_power']
+        )
+        if 'kmeans' in METHODS_TO_RUN:
+            results["kmeans"] = kmeans_prices
+
+    # --- Baseline prices (needed for 'baseline' and 'hybrid') ---
+    if 'baseline' in METHODS_TO_RUN or 'hybrid' in METHODS_TO_RUN:
+        baseline_prices = calculate_baseline_prices(fixed_windows)
+        if 'baseline' in METHODS_TO_RUN:
+            results["baseline"] = baseline_prices
+
+    # --- Hybrid method (combines the two) ---
+    if 'hybrid' in METHODS_TO_RUN:
+        if kmeans_prices is not None and baseline_prices is not None:
+            # Use POST-PROCESSED kmeans and ORIGINAL baseline for hybrid calculation.
+            # The result is the final "original" cost for the hybrid method.
+            kmeans_prices_processed = smart_post_process_prices(
+                kmeans_prices,
+                floor_method=post_process_config['floor_method'],
+                gamma=post_process_config['gamma'],
+                dead_zone_k=post_process_config['dead_zone_k']
+            )
+            
+            alpha = hybrid_config.get('alpha', 0.3)
+            median_baseline = np.median(baseline_prices)
+            modulation = alpha * (baseline_prices - median_baseline)
+            
+            hybrid_prices = kmeans_prices_processed + modulation
+            results['hybrid'] = np.clip(hybrid_prices, 1.0, 50.0)
+
+    return results
 
 def calculate_ground_truth_price(df: pd.DataFrame, window_size: int) -> np.ndarray:
     """Calculates the ground-truth price for each fixed-size window."""
@@ -1568,7 +1268,8 @@ def perform_evaluation_and_plot(
     results: dict, 
     ground_truth: np.ndarray, 
     group_name: str, 
-    sim_id: int
+    sim_id: int,
+    post_process_config: dict
 ) -> dict:
     """Calculates metrics and generates plots for a single run - focused on original and stretched analysis."""
     eval_results = {}
@@ -1582,71 +1283,217 @@ def perform_evaluation_and_plot(
         mae = mean_absolute_error(ground_truth, calculated)
         rmse = np.sqrt(mean_squared_error(ground_truth, calculated))
         
-        # Advanced stretched cost transformation (median-centered inversion + [1-50] scaling)
-        median_cost = np.median(calculated)
-        
-        # Step 1: Center around median (median becomes 0)
-        centered = calculated - median_cost
-        
-        # Step 2: Invert so peaks below median now go above, and vice versa
-        inverted = -centered
-        
-        # Step 3: Re-center around 1 (so median becomes 1)
-        recentered = inverted + 1
-        
-        # Step 4: Clip minimum to 1 (no values below 1)
-        clipped = np.maximum(recentered, 1.0)
-        
-        # Step 5: Stretch between 1 and 50
-        if np.max(clipped) > np.min(clipped):
-            # Scale from current range to [1, 50]
-            stretched_calculated = 1 + 49 * (clipped - np.min(clipped)) / (np.max(clipped) - np.min(clipped))
+        # --- Smart post-processing (robust) ----------------------------------
+        # --- Parameters ------------------------------------------------------
+        floor_method = post_process_config['floor_method']
+        gamma_val = post_process_config['gamma']
+        n_bins_dbg = 40
+        dead_zone_k_dbg = post_process_config['dead_zone_k']
+
+        # --- Debug: compute baseline, epsilon, and intermediate arrays ------
+        hist_dbg, bin_edges_dbg = np.histogram(calculated, bins=n_bins_dbg)
+        mode_idx_dbg = int(np.argmax(hist_dbg))
+        baseline_dbg = (bin_edges_dbg[mode_idx_dbg] + bin_edges_dbg[mode_idx_dbg + 1]) / 2.0
+
+        median_dbg = np.median(calculated)
+
+        deviations_dbg = np.abs(calculated - baseline_dbg)
+        mad_dbg = np.median(np.abs(deviations_dbg - np.median(deviations_dbg)))
+        sigma_hat_dbg = 1.4826 * mad_dbg
+        epsilon_dbg = dead_zone_k_dbg * sigma_hat_dbg if sigma_hat_dbg > 0 else 0.0
+
+        mirrored_dbg = np.where(calculated < baseline_dbg, 2.0 * baseline_dbg - calculated, calculated)
+        mirrored_clipped_dbg = np.where(np.abs(mirrored_dbg - baseline_dbg) < epsilon_dbg, baseline_dbg, mirrored_dbg)
+
+        # Final scaled using same path as helper (duplicated to keep arrays) --
+        if np.isclose(np.max(mirrored_clipped_dbg), baseline_dbg):
+            final_scaled_dbg = np.full_like(calculated, 25.0)
         else:
-            stretched_calculated = np.full_like(calculated, 25.0)
-            
-        stretched_corr, _ = pearsonr(stretched_calculated, ground_truth)
-        stretched_mae = mean_absolute_error(ground_truth, stretched_calculated)
-        stretched_rmse = np.sqrt(mean_squared_error(ground_truth, stretched_calculated))
+            normalised_dbg = (mirrored_clipped_dbg - baseline_dbg) / (np.max(mirrored_clipped_dbg) - baseline_dbg)
+            final_scaled_dbg = 1.0 + 49.0 * (normalised_dbg ** gamma_val)
+
+        smart_stretched_calculated = final_scaled_dbg  # keep naming consistent
+
+        # --- Select cost for evaluation based on method ---
+        if method == 'kmeans':
+            eval_cost = smart_stretched_calculated
+            print(f"  Using POST-PROCESSED costs for '{method}' evaluation.")
+        else: # baseline, hybrid
+            eval_cost = calculated
+            print(f"  Using ORIGINAL costs for '{method}' evaluation.")
+
+        # --- Final Metrics Calculation ---
+        # Handle cases where all values are constant
+        if np.all(eval_cost == eval_cost[0]) or np.all(ground_truth == ground_truth[0]):
+            final_corr = 0.0 # Or some other indicator for constant data
+        else:
+            final_corr, _ = pearsonr(eval_cost, ground_truth)
         
-        # Store focused metrics
+        final_mae = mean_absolute_error(ground_truth, eval_cost)
+        final_rmse = np.sqrt(mean_squared_error(ground_truth, eval_cost))
+        
         eval_results[method] = {
-            "pearson_corr": corr, "mae": mae, "rmse": rmse,
-            "stretched_corr": stretched_corr, "stretched_mae": stretched_mae, "stretched_rmse": stretched_rmse
+            "pearson_corr": final_corr, "mae": final_mae, "rmse": final_rmse,
         }
         
-        # Plotting - Only Time-Series Tracking (No Scatter Plots)
+        # Plotting directory
         plot_dir = os.path.join(RESULTS_DIR, group_name, method)
         os.makedirs(plot_dir, exist_ok=True)
+
+        # ----- Tracking visualisation (more compact) -----------------------
+        fig, axes = plt.subplots(3, 1, figsize=(10, 24))
+
+        # --- Calculate metrics for each subplot ---
+        # Original
+        corr_orig, _ = pearsonr(calculated, ground_truth) if not (np.all(calculated == calculated[0]) or np.all(ground_truth == ground_truth[0])) else (0.0, 0.0)
+        mae_orig = mean_absolute_error(ground_truth, calculated)
+        # Mirrored
+        corr_mid, _ = pearsonr(mirrored_clipped_dbg, ground_truth) if not (np.all(mirrored_clipped_dbg == mirrored_clipped_dbg[0]) or np.all(ground_truth == ground_truth[0])) else (0.0, 0.0)
+        mae_mid = mean_absolute_error(ground_truth, mirrored_clipped_dbg)
+        # Final
+        corr_final_plot, _ = pearsonr(smart_stretched_calculated, ground_truth) if not (np.all(smart_stretched_calculated == smart_stretched_calculated[0]) or np.all(ground_truth == ground_truth[0])) else (0.0, 0.0)
+        mae_final_plot = mean_absolute_error(ground_truth, smart_stretched_calculated)
+
+        # (1) Original prices with diagnostics
+        ax_orig = axes[0]
+        ax_orig.plot(ground_truth, label='Ground-Truth', color='black', lw=2, alpha=0.5)
+        ax_orig.plot(calculated, label='Raw Calc', color='blue', alpha=0.8)
+        ax_orig.axhline(baseline_dbg, color='orange', ls='--', label=f'Baseline (mode={baseline_dbg:.2f})')
+        ax_orig.axhline(median_dbg, color='green', ls=':', label=f'Median={median_dbg:.2f}')
+        if epsilon_dbg > 0:
+            ax_orig.axhline(baseline_dbg + epsilon_dbg, color='red', ls='--', alpha=0.5, label=f'+ε ({epsilon_dbg:.2f})')
+            ax_orig.axhline(max(0, baseline_dbg - epsilon_dbg), color='red', ls='--', alpha=0.5)
+        ax_orig.set_title(f'Original Prices\nCorr={corr_orig:.3f}, MAE={mae_orig:.3f}', fontsize=18)
+        ax_orig.set_xlabel('Window', fontsize=18)
+        ax_orig.set_ylabel('Price', fontsize=18)
+        ax_orig.legend(fontsize=18)
+        ax_orig.grid(True, ls='--', alpha=0.5)
+
+        # (2) Mirrored + dead-zone prices
+        ax_mid = axes[1]
+        ax_mid.plot(ground_truth, label='Ground-Truth', color='black', lw=2, alpha=0.5)
+        ax_mid.plot(mirrored_clipped_dbg, label='Mirrored+DeadZone', color='darkorange', alpha=0.8)
+        ax_mid.axhline(baseline_dbg, color='orange', ls='--', alpha=0.7)
+        if epsilon_dbg > 0:
+            ax_mid.axhline(baseline_dbg + epsilon_dbg, color='red', ls='--', alpha=0.4)
+        ax_mid.set_title(f'After Reflection & Dead-Zone\nCorr={corr_mid:.3f}, MAE={mae_mid:.3f}', fontsize=18)
+        ax_mid.set_xlabel('Window', fontsize=18)
+        ax_mid.set_ylabel('Price', fontsize=18)
+        ax_mid.grid(True, ls='--', alpha=0.5)
+        ax_mid.legend(fontsize=18)
+
+        # (3) Final scaled prices
+        ax_final = axes[2]
+        ax_final.plot(ground_truth, label='Ground-Truth', color='black', lw=2, alpha=0.5)
         
-        # Enhanced Time-Series Tracking Plot - Only Original and Stretched
-        plt.figure(figsize=(16, 8))
+        # Color based on method for final plot
+        plot_color = 'purple'
+        if method == 'baseline':
+            plot_color = 'red'
+        elif method == 'hybrid':
+            plot_color = 'orange'
         
-        # Create 1x2 subplot layout for tracking
-        fig, (ax1, ax2) = plt.subplots(1, 2, figsize=(20, 8))
-        
-        # Original tracking
-        ax1.plot(ground_truth, label='Ground-Truth Price', color='black', lw=2, alpha=0.5)
-        ax1.plot(calculated, label=f'Calculated Price ({method.upper()})', color='blue', alpha=0.8)
-        ax1.set_title(f'Original Price Tracking: {method.upper()} - Sim {sim_id}\nCorr: {corr:.3f}, MAE: {mae:.3f}, RMSE: {rmse:.3f}')
-        ax1.set_xlabel("Window Index")
-        ax1.set_ylabel("Price")
-        ax1.legend()
-        ax1.grid(True, linestyle='--', alpha=0.6)
-        
-        # Median-inverted stretched tracking
-        ax2.plot(ground_truth, label='Ground-Truth Price', color='black', lw=2, alpha=0.5)
-        ax2.plot(stretched_calculated, label=f'Median-Inverted Price [1-50]', color='purple', alpha=0.8)
-        ax2.set_title(f'Median-Inverted Price Tracking: {method.upper()} - Sim {sim_id}\nCorr: {stretched_corr:.3f}, MAE: {stretched_mae:.3f}, RMSE: {stretched_rmse:.3f}')
-        ax2.set_xlabel("Window Index")
-        ax2.set_ylabel("Price")
-        ax2.legend()
-        ax2.grid(True, linestyle='--', alpha=0.6)
-        
-        plt.tight_layout()
-        plt.savefig(os.path.join(plot_dir, f"sim_{sim_id}_tracking_comparison.png"), dpi=150, bbox_inches='tight')
-        plt.close()
+        ax_final.plot(smart_stretched_calculated, label='Final Scaled', color=plot_color, alpha=0.8)
+        ax_final.set_title(f'Post-Processed [1-50]\nCorr={corr_final_plot:.3f}, MAE={mae_final_plot:.3f}', fontsize=18)
+        ax_final.set_xlabel('Window', fontsize=18)
+        ax_final.set_ylabel('Price', fontsize=18)
+        ax_final.grid(True, ls='--', alpha=0.5)
+        ax_final.legend(fontsize=18)
+
+        fig.suptitle(f'{method.upper()} – Simulation {sim_id}', fontsize=18)
+        fig.tight_layout(rect=(0, 0.03, 1, 0.95))
+        fig.savefig(os.path.join(plot_dir, f"sim_{sim_id}_tracking_comparison.png"), dpi=150, bbox_inches='tight')
+        plt.close(fig)
         
     return eval_results
+
+def plot_pca_cluster_scatterplot(
+    scaled_features: np.ndarray,
+    cluster_labels: Union[np.ndarray, List[int]],
+    contexts: List[str],
+    group_name: str,
+    output_dir: str
+):
+    """
+    Generates a PCA scatter plot of clustered data, colored by context.
+
+    Args:
+        scaled_features: The scaled feature matrix (n_samples, n_features).
+        cluster_labels: The cluster label for each sample.
+        contexts: The ground-truth context for each sample.
+        group_name: Name of the physics group for titling.
+        output_dir: Directory to save the plot.
+    """
+    print("  Generating PCA cluster scatter plot for visualization...")
+
+    # Always use PCA with 2 components for visualization
+    try:
+        pca_viz = PCA(n_components=2, random_state=42)
+        principal_components = pca_viz.fit_transform(scaled_features)
+    except Exception as e:
+        print(f"    Could not perform PCA for visualization: {e}")
+        return
+
+    # Create a DataFrame for plotting
+    df_plot = pd.DataFrame({
+        'PC1': principal_components[:, 0],
+        'PC2': principal_components[:, 1],
+        'context': [get_generic_context(c) for c in contexts],
+        'cluster': cluster_labels
+    })
+
+    # Calculate centroids in the PCA space
+    pca_centroids = df_plot.groupby('cluster')[['PC1', 'PC2']].mean()
+
+    # Create the plot
+    plt.figure(figsize=(16, 12))
+    
+    # Use a color palette
+    unique_contexts = sorted(df_plot['context'].unique())
+    palette = sns.color_palette("husl", n_colors=len(unique_contexts))
+    context_colors = dict(zip(unique_contexts, palette))
+
+    ax = sns.scatterplot(
+        data=df_plot,
+        x='PC1',
+        y='PC2',
+        hue='context',
+        palette=context_colors,
+        style='cluster',
+        alpha=0.8,
+        s=80
+    )
+
+    # Plot centroids
+    ax.scatter(
+        pca_centroids['PC1'],
+        pca_centroids['PC2'],
+        marker='X',
+        s=200,
+        c='black',
+        edgecolors='white',
+        linewidth=1,
+        label='Cluster Centroids'
+    )
+
+    # Annotate centroids
+    for i, centroid in pca_centroids.iterrows():
+        ax.text(centroid['PC1'] + 0.05, centroid['PC2'] + 0.05, f'C{i}', fontsize=12, weight='bold', color='black')
+
+    ax.set_title(f'PCA Scatter Plot of Clusters for {group_name}', fontsize=16)
+    ax.set_xlabel('Principal Component 1', fontsize=12)
+    ax.set_ylabel('Principal Component 2', fontsize=12)
+    ax.legend(title='Context', bbox_to_anchor=(1.05, 1), loc='upper left')
+    ax.grid(True, linestyle='--', alpha=0.6)
+    
+    # Save the plot
+    plot_path = os.path.join(output_dir, f"{group_name}_pca_cluster_plot.png")
+    os.makedirs(output_dir, exist_ok=True)
+    
+    plt.savefig(plot_path, dpi=150, bbox_inches='tight')
+    plt.close()
+    
+    print(f"  PCA scatter plot saved to {plot_path}")
 
 def plot_group_summary_tracking(group_name: str, all_run_results: list):
     """
@@ -1657,50 +1504,41 @@ def plot_group_summary_tracking(group_name: str, all_run_results: list):
         return
 
     for method in METHODS_TO_RUN:
+        # Gather parts for this method
+        gt_parts = [r['ground_truth'] for r in all_run_results if r]
+        calc_parts = [r['results'][method] for r in all_run_results if r and method in r['results']]
+
+        if not gt_parts or not calc_parts:
+            print(f"  Skipping group summary plot for method '{method}' - no data found.")
+            continue
+
         # Concatenate results from all runs in the group
-        ground_truth_all = np.concatenate([r['ground_truth'] for r in all_run_results if r])
-        calculated_all = np.concatenate([r['results'][method] for r in all_run_results if r and method in r['results']])
+        ground_truth_all = np.concatenate(gt_parts)
+        calculated_all = np.concatenate(calc_parts)
         
         if len(ground_truth_all) == 0 or len(calculated_all) == 0:
             continue
 
-        # For kmeans method, apply median-inverted stretched transformation
+        # Use post-processed costs for specified methods for this plot
         if method == 'kmeans':
-            # Apply the same median-centered inversion + [1-50] scaling transformation
-            median_cost = np.median(calculated_all)
-            
-            # Step 1: Center around median (median becomes 0)
-            centered = calculated_all - median_cost
-            
-            # Step 2: Invert so peaks below median now go above, and vice versa
-            inverted = -centered
-            
-            # Step 3: Re-center around 1 (so median becomes 1)
-            recentered = inverted + 1
-            
-            # Step 4: Clip minimum to 1 (no values below 1)
-            clipped = np.maximum(recentered, 1.0)
-            
-            # Step 5: Stretch between 1 and 50
-            if np.max(clipped) > np.min(clipped):
-                # Scale from current range to [1, 50]
-                calculated_all = 1 + 49 * (clipped - np.min(clipped)) / (np.max(clipped) - np.min(clipped))
-            else:
-                calculated_all = np.full_like(calculated_all, 25.0)
-            
-            display_method = f"{method.upper()} (Median-Inverted [1-50])"
+            calculated_all = smart_post_process_prices(calculated_all)
+            display_method = f"{method.upper()} (Post-Processed)"
             plot_color = 'purple'
-        else:
-            # For baseline, use original values
-            display_method = f"{method.upper()}"
-            plot_color = 'red'
+        else: # baseline, hybrid
+            display_method = f"{method.upper()} (Original)"
+            if method == 'baseline':
+                plot_color = 'red'
+            elif method == 'hybrid':
+                plot_color = 'orange'
+            else: # xgboost
+                plot_color = 'green'
 
         # Sort data by ground-truth price
         sort_indices = np.argsort(ground_truth_all)
         ground_truth_sorted = ground_truth_all[sort_indices]
         calculated_sorted = calculated_all[sort_indices]
 
-        plt.figure(figsize=(20, 8))
+        plt.figure(figsize=(12, 12))
         plt.plot(ground_truth_sorted, label='Ground-Truth Price', color='black', lw=2, alpha=0.7)
         plt.plot(calculated_sorted, label=f'Calculated Price ({display_method})', color=plot_color, alpha=0.7, linestyle='--')
         
@@ -1709,10 +1547,10 @@ def plot_group_summary_tracking(group_name: str, all_run_results: list):
                 [ground_truth_sorted.min(), ground_truth_sorted.max()], 
                 'g--', alpha=0.5, label='Perfect Prediction')
 
-        plt.title(f'Group Summary Price Tracking: {group_name} - {display_method} (Reconstruction Errors) (Sorted by Ground Truth)')
-        plt.xlabel("Data Points (Sorted by Ground-Truth Price)")
-        plt.ylabel("Price")
-        plt.legend()
+        plt.title(f'Group Summary Price Tracking: {group_name} - {display_method}', fontsize=18)
+        plt.xlabel("Data Points (Sorted by Ground-Truth Price)", fontsize=18)
+        plt.ylabel("Price", fontsize=18)
+        plt.legend(fontsize=18)
         plt.grid(True, linestyle='--', alpha=0.6)
         
         output_path = os.path.join(RESULTS_DIR, group_name, f"summary_tracking_{method}.png")
@@ -1720,26 +1558,120 @@ def plot_group_summary_tracking(group_name: str, all_run_results: list):
         plt.close()
         print(f"  Group summary plot saved to: {output_path}") 
 
+# --- Utility: Robust Smart Post-Processing -----------------------------------
+
+def smart_post_process_prices(
+    prices: np.ndarray,
+    *,
+    floor_method: str = "mode",   # 'mode', 'median', 'percentile'
+    gamma: float = 0.6,            # <1 expands mid-range, compresses extremes
+    n_bins: int = 40,
+    percentile_value: float = 40.0,
+    dead_zone_k: float = 3.0       # k * σ̂ (σ̂≈1.4826·MAD) within which bumps are flattened
+) -> np.ndarray:
+    """Transform *calculated* prices into the final [1, 50] billing range.
+
+    Steps
+    -----
+    1. Determine a *baseline* (the "floor") using *floor_method*:
+       • 'mode' – bin the data and take the bin centre with the most samples.
+       • 'median' – classic median.
+       • 'percentile' – lower percentile (e.g. 40th).
+    2. Compute MAD-based ε (dead-zone):
+       • Median Absolute Deviation (MAD)
+       • Robust σ estimate under normal noise (σ̂≈1.4826·MAD)
+       • ε = k * σ̂ (k=3.0 for 99.7% coverage)
+    3. Mirror values below the baseline so negative peaks become positive ones.
+    4. Apply a power-law (gamma) to compress very large peaks (gamma<1).
+    5. Stretch linearly to the [1, 50] billing range.
+
+    The function gracefully handles corner-cases (empty / flat arrays).
+    """
+    prices = np.asarray(prices, dtype=float)
+    if prices.size == 0:
+        return prices
+
+    # --- Step 1: baseline ----------------------------------------------------
+    if floor_method == "mode":
+        hist, bin_edges = np.histogram(prices, bins=n_bins)
+        mode_idx = int(np.argmax(hist))
+        baseline = (bin_edges[mode_idx] + bin_edges[mode_idx + 1]) / 2.0
+    elif floor_method == "median":
+        baseline = float(np.median(prices))
+    elif floor_method == "percentile":
+        baseline = float(np.percentile(prices, percentile_value))
+    else:
+        raise ValueError(f"Unknown floor_method '{floor_method}'.")
+
+    # --- Step 2: compute MAD-based ε (dead-zone) ----------------------------
+    deviations = np.abs(prices - baseline)
+    # Median Absolute Deviation
+    mad = np.median(np.abs(deviations - np.median(deviations)))
+    sigma_hat = 1.4826 * mad  # robust σ estimate under normal noise
+    epsilon = dead_zone_k * sigma_hat if sigma_hat > 0 else 0.0
+
+    # --- Step 3: mirror values below baseline ------------------------------
+    mirrored = np.where(prices < baseline, 2.0 * baseline - prices, prices)
+
+    # Apply dead-zone: bumps with deviation < ε are treated as baseline
+    if epsilon > 0:
+        mirrored = np.where(np.abs(mirrored - baseline) < epsilon, baseline, mirrored)
+
+    max_val = float(np.max(mirrored))
+    if np.isclose(max_val, baseline):
+        # Flat profile – map to mid-price 25.0
+        return np.full_like(prices, 25.0)
+
+    # --- Step 4 & 5: normalise + power-law scaling --------------------------
+    normalised = (mirrored - baseline) / (max_val - baseline)
+    gamma = max(1e-3, float(gamma))
+    transformed = normalised ** gamma
+
+    # --- Step 6: map to [1, 50] --------------------------------------------
+    scaled = 1.0 + 49.0 * transformed
+    return scaled
+
 # --- Main Execution ---
 
 def main():
     """Main function to run the enhanced experiment using reconstruction error signals."""
+    global RESULTS_DIR
     parser = argparse.ArgumentParser(description="Run the enhanced billing validation experiment using reconstruction error signals.")
     parser.add_argument(
         "--group",
         type=str,
+        default=None,
         help="Run the experiment for a single specified physics group (e.g., 'group_1')."
     )
+    parser.add_argument(
+        "--results-dir",
+        type=str,
+        default="results_experiment2_old",
+        help="Directory to save all results, plots, and summaries."
+    )
     args = parser.parse_args()
+
+    # Update RESULTS_DIR from CLI and ensure it exists
+    RESULTS_DIR = args.results_dir
+    os.makedirs(RESULTS_DIR, exist_ok=True)
 
     groups_to_process = PHYSICS_GROUPS
     if args.group:
         if args.group in PHYSICS_GROUPS:
             groups_to_process = {args.group: PHYSICS_GROUPS[args.group]}
-            print(f"--- Running enhanced experiment for single group: {args.group} ---")
+            print(f"--- Running enhanced experiment for single specified group: {args.group} ---")
         else:
             print(f"Error: Group '{args.group}' not found in PHYSICS_GROUPS. Available groups are: {list(PHYSICS_GROUPS.keys())}")
             return
+    elif args.group is None:
+        print("--- Running enhanced experiment for ALL physics groups ---")
+    
+    # Create config dict for post-processing to pass to functions
+    post_process_config = {
+        'floor_method': 'mode',
+        'gamma': 0.6,
+        'dead_zone_k': 3.0,
+    }
 
     print("🚗 EXPERIMENT 2: Enhanced Billing Validation using Reconstruction Error Signals")
     print("=" * 80)
@@ -1748,9 +1680,7 @@ def main():
     print(f"📈 Methods: {METHODS_TO_RUN}")
     print(f"🎯 Dimensionality Reduction: {DIMENSIONALITY_REDUCTION['method']}")
     print(f"💰 Pricing Strategy: {PRICING_STRATEGY['method']}")
-    print("🔧 Improvements:")
-    print(f"   - SMOTE Class Balancing: {IMPROVEMENTS_CONFIG['use_smote']}")
-    print(f"   - Mahalanobis Distance: {IMPROVEMENTS_CONFIG['use_mahalanobis']}")
+    print(f"⚙️ Post-Processing: gamma={post_process_config['gamma']}, dead_zone_k={post_process_config['dead_zone_k']}")
     print("=" * 80)
 
     all_results_list = []
@@ -1779,7 +1709,12 @@ def main():
         for sim_num in params['seq_range']:
             # Correct glob pattern for filenames like 'simulation_1_...'
             pattern = os.path.join(PROCESSED_DATA_DIR, f"simulation_{sim_num}_*.csv")
-            group_csv_files.extend(glob.glob(pattern))
+            found_files = glob.glob(pattern)
+            if found_files:
+                group_csv_files.extend(found_files)
+                print(f"  Found {len(found_files)} files for sim_num {sim_num} with pattern: {pattern}")
+            else:
+                print(f"  No files found for sim_num {sim_num} with pattern: {pattern}")
 
         if not group_csv_files:
             print(f"  No CSV files found for {group_name}. Skipping.")
@@ -1791,211 +1726,179 @@ def main():
         train_files = group_csv_files[:n_train_files]
         validation_files = group_csv_files[n_train_files:]
         
-        # Apply fast validation limits if enabled
-        if FAST_VALIDATION.get('enabled', False):
-            max_train = FAST_VALIDATION.get('max_train_files', 5)
-            max_val = FAST_VALIDATION.get('max_val_files', 3)
-            
-            if len(train_files) > max_train:
-                train_files = train_files[:max_train]
-                print(f"  Fast validation: Limited to {max_train} training files")
-            
-            if len(validation_files) > max_val:
-                validation_files = validation_files[:max_val]
-                print(f"  Fast validation: Limited to {max_val} validation files")
-        
         print(f"  Split: {len(train_files)} training files, {len(validation_files)} validation files")
         
         if not train_files or not validation_files:
             print(f"  Insufficient files for train/validation split. Skipping group.")
             continue
         
-        # 2. Generate/Load Reconstruction Error Windows for Training Data
-        print(f"\n  Processing training data to build clustering model...")
-        all_training_windows = []
-        all_training_contexts = []
+        # 2. Generate Reconstruction Error Signals for Training Data
+        print(f"  Generating reconstruction error signals for training data...")
+        train_dfs_with_errors = []
         
         for train_file in train_files:
-            error_windows, window_contexts = get_or_generate_error_windows(
-                train_file, autoencoder_model, autoencoder_scaler, group_name
-            )
-            if error_windows is not None and window_contexts is not None:
-                all_training_windows.append(error_windows)
-                all_training_contexts.extend(window_contexts)
-
-        if not all_training_windows:
-            print(f"  Could not generate or load any training windows for {group_name}. Skipping.")
-            continue
-
-        all_training_windows = np.vstack(all_training_windows)
+            try:
+                df = pd.read_csv(train_file)
+                df = process_data_for_autoencoder(df)
+                df_with_errors = generate_reconstruction_error_signals(df, autoencoder_model, autoencoder_scaler)
+                train_dfs_with_errors.append(df_with_errors)
+            except Exception as e:
+                print(f"    Error processing {train_file}: {e}")
+                continue
         
-        # 3. Create Initial Centroids from a subset of training windows
-        # Group windows by context to select one representative for each
-        grouped_windows = defaultdict(list)
-        for window, context in zip(all_training_windows, all_training_contexts):
-            generic_ctx = get_generic_context(context)
-            grouped_windows[generic_ctx].append(window)
+        if not train_dfs_with_errors:
+            print(f"  Could not generate reconstruction error signals for any training files. Skipping group.")
+            continue
+        
+        # Combine all training data
+        train_df = pd.concat(train_dfs_with_errors, ignore_index=True)
+        
+        # Check if we have the required reconstruction error columns
+        available_error_columns = [col for col in RECONSTRUCTION_ERROR_COLUMNS if col in train_df.columns]
+        if not available_error_columns:
+            print(f"  No reconstruction error columns found in training data. Skipping group.")
+            continue
+        
+        print(f"  Using {len(available_error_columns)} reconstruction error signals as features")
+        
+        # 3. Create initial centroids from representative "archetype" windows
+        context_col = 'CONTEXT' if 'CONTEXT' in train_df.columns else 'context'
+        
+        valid_rows = ~train_df[available_error_columns].isnull().any(axis=1)
+        train_df_clean = train_df[valid_rows].copy()
+        
+        if train_df_clean.empty:
+            print(f"  No valid reconstruction error data found for {group_name}. Skipping.")
+            continue
+        
+        context_blocks = extract_contiguous_context_blocks(train_df_clean, available_error_columns, context_col)
+        archetype_windows, archetype_contexts = create_context_representative_samples(context_blocks)
+
+        if not archetype_windows:
+            print(f"  Could not extract any archetype windows for centroid initialization. Skipping.")
+            continue
+            
+        grouped_archetypes = defaultdict(list)
+        for window, context in zip(archetype_windows, archetype_contexts):
+            grouped_archetypes[get_generic_context(context)].append(window)
 
         initial_centroids = []
         centroid_contexts = []
-        for ctx, w_list in grouped_windows.items():
-            # Select a random window from this context group as a representative
-            selected_window = random.choice(w_list)
-            initial_centroids.append(selected_window)
+        for ctx, w_list in grouped_archetypes.items():
+            valid_windows = [w for w in w_list if w.shape[0] > 1]
+            if not valid_windows: continue
+            initial_centroids.append(random.choice(valid_windows))
             centroid_contexts.append(ctx)
-        
+
         if not initial_centroids:
-            print(f"  No valid centroids could be found for {group_name}. Skipping group.")
+            print(f"  No valid initial centroids could be selected for {group_name}. Skipping group.")
             continue
             
-        print(f"  Identified {len(initial_centroids)} unique contexts to use as initial centroids.")
+        print(f"  Selected {len(initial_centroids)} initial centroids from archetype windows.")
 
-        # 4. Set Up Pricing for Centroids
+        # 4. Create a balanced training set for KMeans fitting
+        all_training_windows, all_training_contexts = create_fixed_windows_for_training(
+            train_df_clean, available_error_columns, context_col=context_col
+        )
+
+        if not all_training_windows:
+            print("  No training windows could be generated. Skipping group.")
+            continue
+            
+        all_windows_grouped_by_context = defaultdict(list)
+        for window, context in zip(all_training_windows, all_training_contexts):
+            all_windows_grouped_by_context[get_generic_context(context)].append(window)
+        
+        # Remove contexts that didn't yield any windows
+        all_windows_grouped_by_context = {k: v for k, v in all_windows_grouped_by_context.items() if v}
+
+        if not all_windows_grouped_by_context:
+            print("  Could not group any training windows by context. Skipping group.")
+            continue
+
+        min_windows_per_context = min(len(w) for w in all_windows_grouped_by_context.values())
+        print(f"  Balancing dataset: Found {min_windows_per_context} windows for the least frequent context.")
+        print(f"  Selecting {min_windows_per_context} windows from each context for training.")
+
+        balanced_windows = []
+        balanced_contexts = []
+        for ctx, w_list in all_windows_grouped_by_context.items():
+            sampled_windows = random.sample(w_list, min_windows_per_context)
+            balanced_windows.extend(sampled_windows)
+            balanced_contexts.extend([ctx] * min_windows_per_context)
+            
+        print(f"  Created a balanced training set with {len(balanced_windows)} total windows.")
+
+        # 5. Set Up Pricing
         centroid_prices = np.array([get_price_for_context(c) for c in centroid_contexts])
         print(f"  Centroid contexts: {centroid_contexts}")
         print(f"  Centroid prices: {centroid_prices}")
         print(f"  Price range: {np.min(centroid_prices):.1f} to {np.max(centroid_prices):.1f}")
         print(f"  Using pricing strategy: {PRICING_STRATEGY['method']}")
-        
-        # 5. Feature Extraction for all training windows
-        print(f"\n  Extracting features for {len(all_training_windows)} training windows...")
-        all_windows_features = extract_enhanced_features_from_reconstruction_errors(all_training_windows)
-        print(f"  Extracted features shape: {all_windows_features.shape}")
 
-        # === Enhanced Model Fitting with Class Balancing ===
-        n_clusters = len(initial_centroids)
-        print(f"\n  Preparing training data for clustering...")
+        # === Enhanced Model Fitting ===
         
-        # A. Report class distribution before balancing
-        context_counts = Counter(all_training_contexts)
-        print(f"  Training data class distribution: {dict(context_counts)}")
+        n_clusters = len(initial_centroids)
+        
+        # === KMeans Model Fitting with Intelligent Dimensionality Reduction ===
+        print("  Fitting KMeans with intelligent dimensionality reduction on the balanced dataset...")
+        
+        # A. Extract enhanced features from all balanced training windows
+        all_windows_features_list = []
+        for window in balanced_windows:
+            window_array = window[np.newaxis, :, :] if window.ndim == 2 else window
+            features = extract_enhanced_features_from_reconstruction_errors(window_array)
+            all_windows_features_list.append(features[0])
+        
+        all_windows_features = np.vstack(all_windows_features_list)
+        print(f"  Extracted features shape from balanced set: {all_windows_features.shape}")
         
         # B. Apply standardization
         scaler_kmeans = StandardScaler().fit(all_windows_features)
-        scaled_features = np.array(scaler_kmeans.transform(all_windows_features))
+        scaled_features = scaler_kmeans.transform(all_windows_features)
+        assert isinstance(scaled_features, np.ndarray)
         
-        # C. Apply SMOTE class balancing if enabled
-        balanced_features, balanced_contexts = apply_smote_balancing(
-            scaled_features, all_training_contexts, IMPROVEMENTS_CONFIG
-        )
+        # C. Dimensionality reduction is no longer applied to the training pipeline.
+        #    KMeans will be fitted on the scaled, high-dimensional features.
         
-        # D. Apply intelligent dimensionality reduction  
-        reduced_features, dimensionality_reducer = apply_dimensionality_reduction(
-            balanced_features, 
-            labels=balanced_contexts,  # Use balanced context labels for supervised methods
-            config=DIMENSIONALITY_REDUCTION
-        )
+        # D. Transform initial centroids to same feature space
+        initial_centroids_features_list = []
+        for centroid in initial_centroids:
+            centroid_array = centroid[np.newaxis, :, :] if centroid.ndim == 2 else centroid
+            features = extract_enhanced_features_from_reconstruction_errors(centroid_array)
+            initial_centroids_features_list.append(features[0])
         
-        # E. Transform initial centroids to same feature space
-        initial_centroids_features = extract_enhanced_features_from_reconstruction_errors(np.array(initial_centroids))
-        scaled_centroids = np.array(scaler_kmeans.transform(initial_centroids_features))
-        transformed_initial_centroids = transform_new_features(
-            scaled_centroids, 
-            dimensionality_reducer, 
-            DIMENSIONALITY_REDUCTION['method']
+        initial_centroids_features = np.vstack(initial_centroids_features_list)
+        scaled_centroids = scaler_kmeans.transform(initial_centroids_features)
+        # No further transformation needed for initial centroids
+
+        # E. Fit KMeans model on scaled, high-dimensional features
+        kmeans_model = KMeans(n_clusters=n_clusters, init=scaled_centroids, n_init=1, random_state=42).fit(scaled_features)  # type: ignore
+        final_kmeans_centroids = kmeans_model.cluster_centers_
+        
+        print(f"  KMeans trained with {n_clusters} clusters in {scaled_features.shape[1]}D space")
+
+        # Generate and save the PCA scatter plot for cluster visualization
+        if getattr(kmeans_model, 'labels_', None) is not None:
+            # The labels_ attribute exists and is not None
+            labels_arr = np.asarray(kmeans_model.labels_)
+            cluster_labels_safe = labels_arr.tolist()
+        else:
+            # Fallback if labels_ does not exist or is None
+            cluster_labels_safe = [0] * len(scaled_features)
+
+        plot_pca_cluster_scatterplot(
+            scaled_features=scaled_features,
+            cluster_labels=cluster_labels_safe,
+            contexts=balanced_contexts,
+            group_name=group_name,
+            output_dir=os.path.join(RESULTS_DIR, group_name)
         )
-
-        # === Train all specified clustering models ===
-        trained_models = {}
-
-        for method in METHODS_TO_RUN:
-            if method == 'baseline':
-                continue
-
-            # Skip kmedoids if not available
-            if method == 'kmedoids' and not KMEDOIDS_AVAILABLE:
-                print("  KMedoids not available, skipping.")
-                continue
-
-            print(f"\n--- Training {method.upper()} model ---")
-
-            # F. Fit clustering model
-            if method == 'kmedoids':
-                from sklearn.metrics.pairwise import pairwise_distances_argmin
-                closest_medoid_indices = pairwise_distances_argmin(transformed_initial_centroids, reduced_features)
-                initial_medoids = reduced_features[closest_medoid_indices.astype(int)]
-                print(f"  KMedoids initialized with {len(initial_medoids)} closest data points...")
-                clustering_model = KMedoids(n_clusters=n_clusters, init=initial_medoids, random_state=42) # type: ignore
-            else: # 'kmeans'
-                clustering_model = KMeans(n_clusters=n_clusters, init=transformed_initial_centroids, n_init=1, random_state=42) # type: ignore
-            
-            clustering_model.fit(reduced_features)
-            method_final_centroids = clustering_model.cluster_centers_
-            method_cluster_labels = clustering_model.labels_
-
-            # Ensure cluster centers and labels are valid numpy arrays before proceeding
-            if not isinstance(method_final_centroids, np.ndarray) or not isinstance(method_cluster_labels, np.ndarray):
-                print(f"  Warning: Could not get valid clusters for {method}. Skipping.")
-                continue
-
-            # G. Handle single-element clusters for this method
-            method_final_centroids, method_cluster_labels = handle_single_element_clusters(
-                method_final_centroids, method_cluster_labels, reduced_features, min_cluster_size=2,
-                is_kmedoids=(method == 'kmedoids')
-            )
-
-            # H. Update centroid_prices to match the final number of clusters for this method
-            method_centroid_prices = centroid_prices.copy() # Start with original
-            if len(method_final_centroids) != len(method_centroid_prices):
-                print(f"  Updating centroid prices for {method.upper()} from {len(method_centroid_prices)} to {len(method_final_centroids)} clusters")
-                updated_prices = []
-                
-                # This loop iterates through the new cluster indices from 0 to N-1.
-                # It is robust to cases where the number of centroids and unique labels might unexpectedly differ.
-                for cluster_idx in range(len(method_final_centroids)):
-                    cluster_mask = method_cluster_labels == cluster_idx
-                    
-                    if not np.any(cluster_mask):
-                        # This can happen if handle_single_element_clusters or the clustering model
-                        # produces a centroid for which no points are labeled.
-                        print(f"    Warning: Cluster {cluster_idx} is empty. Assigning default price 3.0.")
-                        updated_prices.append(3.0)
-                        continue
-
-                    cluster_contexts = np.array(balanced_contexts)[cluster_mask]
-                    
-                    if len(cluster_contexts) > 0:
-                        context_counts = Counter(cluster_contexts)
-                        max_count = context_counts.most_common(1)[0][1]
-                        tied_contexts = [ctx for ctx, count in context_counts.items() if count == max_count]
-                        
-                        if len(tied_contexts) == 1:
-                            updated_prices.append(get_price_for_context(tied_contexts[0]))
-                        else:
-                            # Break tie by most expensive context
-                            tied_prices = [get_price_for_context(ctx) for ctx in tied_contexts]
-                            updated_prices.append(max(tied_prices))
-                    else:
-                        # This case should not happen if the cluster has members, but as a safeguard:
-                        print(f"    Warning: Cluster {cluster_idx} has members but no contexts. Assigning default price 3.0.")
-                        updated_prices.append(3.0)
-                
-                method_centroid_prices = np.array(updated_prices)
-                print(f"  Updated {method.upper()} centroid prices: {method_centroid_prices}")
-
-            # I. Pre-compute inverse covariance matrices for this method
-            method_inv_covs = None
-            if IMPROVEMENTS_CONFIG.get('use_mahalanobis', False):
-                print(f"  Pre-computing cluster covariances for {method.upper()}...")
-                method_inv_covs = compute_cluster_covariances(
-                    reduced_features,
-                    method_cluster_labels,
-                    method_final_centroids,
-                    regularization=IMPROVEMENTS_CONFIG['mahalanobis_regularization']
-                )
-
-            # Store all artifacts for this model
-            trained_models[method] = {
-                'final_centroids': method_final_centroids,
-                'centroid_prices': method_centroid_prices,
-                'inv_covs': method_inv_covs
-            }
-            print(f"  ✅ {method.upper()} model trained successfully.")
 
         # === Steps 3, 4, 5: Runtime Simulation, Billing, and Evaluation ===
         
-        # TRAINING EVALUATION: Efficiently reuse loaded training data
-        print("\n  Evaluating performance on TRAINING data...")
+                        # TRAINING EVALUATION: Check performance on training data
+        print("  Evaluating performance on TRAINING data...")
         train_run_results_for_plotting = []
         for csv_file in train_files:
             sim_id_match = re.search(r'simulation_(\d+)_', os.path.basename(csv_file))
@@ -2005,44 +1908,49 @@ def main():
             print(f"    Evaluating training simulation {sim_id}...")
             
             try:
-                # Load the pre-processed error windows and contexts from cache/generation
-                fixed_windows_errors, ground_truth_contexts = get_or_generate_error_windows(
-                    csv_file, autoencoder_model, autoencoder_scaler, group_name
+                run_df = pd.read_csv(csv_file)
+                run_df = process_data_for_autoencoder(run_df)
+                run_df_with_errors = generate_reconstruction_error_signals(run_df, autoencoder_model, autoencoder_scaler)
+                
+                if run_df_with_errors.empty: continue
+
+                # Create fixed-size windows from reconstruction error signals
+                error_data = run_df_with_errors[available_error_columns].values
+                
+                # Filter out NaN rows
+                valid_mask = ~np.isnan(error_data).any(axis=1)
+                error_data_clean = error_data[valid_mask]
+                
+                if len(error_data_clean) < FIXED_WINDOW_SIZE: continue
+                
+                fixed_windows_errors = create_windows(error_data_clean, FIXED_WINDOW_SIZE)
+                if fixed_windows_errors.shape[0] == 0: continue
+
+                # Calculate Price using trained models
+                calculated_prices = calculate_prices(
+                    fixed_windows_errors,
+                    centroid_prices,
+                    final_kmeans_centroids,
+                    scaler_kmeans,
+                    PRICING_STRATEGY,
+                    HYBRID_PARAMS,
+                    post_process_config
                 )
                 
-                if fixed_windows_errors is None or ground_truth_contexts is None: 
-                    print(f"    Skipping sim {sim_id} due to processing error.")
-                    continue
-
-                # Apply fast validation window limit
-                if FAST_VALIDATION.get('enabled', False):
-                    max_windows = FAST_VALIDATION.get('max_windows_per_file', 100)
-                    if fixed_windows_errors.shape[0] > max_windows:
-                        fixed_windows_errors = fixed_windows_errors[:max_windows]
-                        ground_truth_contexts = ground_truth_contexts[:max_windows]
-                        print(f"    Fast validation: Limited to {max_windows} windows")
-
-                # Calculate prices for all configured methods
-                calculated_prices = {}
-                if 'baseline' in METHODS_TO_RUN:
-                    calculated_prices['baseline'] = calculate_baseline_prices(fixed_windows_errors)
-
-                for method, artifacts in trained_models.items():
-                    calculated_prices[method] = calculate_cluster_prices(
-                        fixed_windows_errors,
-                        artifacts['centroid_prices'],
-                        artifacts['final_centroids'],
-                        scaler_kmeans,
-                        dimensionality_reducer,
-                        DIMENSIONALITY_REDUCTION['method'],
-                        inv_covs=artifacts['inv_covs']
-                    )
-                
-                # Ground-Truth Price Calculation from window contexts
-                ground_truth_prices = np.array([get_price_for_context(ctx) for ctx in ground_truth_contexts])
+                # Ground-Truth Price Calculation (using valid rows only)
+                context_col = 'CONTEXT' if 'CONTEXT' in run_df_with_errors.columns else 'context'
+                run_df_valid = run_df_with_errors[valid_mask].copy()
+                assert isinstance(run_df_valid, pd.DataFrame)  # Type assertion for linter
+                ground_truth_prices = calculate_ground_truth_price(run_df_valid, FIXED_WINDOW_SIZE)
 
                 # Evaluation and Analysis (Training)
-                run_evals = perform_evaluation_and_plot(calculated_prices, ground_truth_prices, f"{group_name}_TRAIN", sim_id)
+                run_evals = perform_evaluation_and_plot(
+                    calculated_prices, 
+                    ground_truth_prices, 
+                    f"{group_name}_TRAIN", 
+                    sim_id,
+                    post_process_config
+                )
                 
                 # Store results for the group-level summary plot
                 if calculated_prices and ground_truth_prices.size > 0:
@@ -2067,8 +1975,8 @@ def main():
                 print(f"    Error evaluating simulation {sim_id}: {e}")
                 continue
         
-        # VALIDATION EVALUATION: Test on validation files (never seen during training)
-        print("\n  Evaluating performance on VALIDATION data...")
+                        # VALIDATION EVALUATION: Test on validation files (never seen during training)
+        print("  Evaluating performance on VALIDATION data...")
         validation_run_results_for_plotting = []
         for csv_file in validation_files:
             sim_id_match = re.search(r'simulation_(\d+)_', os.path.basename(csv_file))
@@ -2078,44 +1986,49 @@ def main():
             print(f"    Evaluating validation simulation {sim_id}...")
             
             try:
-                # Load the pre-processed error windows and contexts from cache/generation
-                fixed_windows_errors, ground_truth_contexts = get_or_generate_error_windows(
-                    csv_file, autoencoder_model, autoencoder_scaler, group_name
+                run_df = pd.read_csv(csv_file)
+                run_df = process_data_for_autoencoder(run_df)
+                run_df_with_errors = generate_reconstruction_error_signals(run_df, autoencoder_model, autoencoder_scaler)
+                
+                if run_df_with_errors.empty: continue
+
+                # Create fixed-size windows from reconstruction error signals
+                error_data = run_df_with_errors[available_error_columns].values
+                
+                # Filter out NaN rows
+                valid_mask = ~np.isnan(error_data).any(axis=1)
+                error_data_clean = error_data[valid_mask]
+                
+                if len(error_data_clean) < FIXED_WINDOW_SIZE: continue
+                
+                fixed_windows_errors = create_windows(error_data_clean, FIXED_WINDOW_SIZE)
+                if fixed_windows_errors.shape[0] == 0: continue
+
+                # Calculate Price using trained models
+                calculated_prices = calculate_prices(
+                    fixed_windows_errors,
+                    centroid_prices,
+                    final_kmeans_centroids,
+                    scaler_kmeans,
+                    PRICING_STRATEGY,
+                    HYBRID_PARAMS,
+                    post_process_config
                 )
                 
-                if fixed_windows_errors is None or ground_truth_contexts is None: 
-                    print(f"    Skipping sim {sim_id} due to processing error.")
-                    continue
-
-                # Apply fast validation window limit
-                if FAST_VALIDATION.get('enabled', False):
-                    max_windows = FAST_VALIDATION.get('max_windows_per_file', 100)
-                    if fixed_windows_errors.shape[0] > max_windows:
-                        fixed_windows_errors = fixed_windows_errors[:max_windows]
-                        ground_truth_contexts = ground_truth_contexts[:max_windows]
-                        print(f"    Fast validation: Limited to {max_windows} windows")
-
-                # Calculate prices for all configured methods
-                calculated_prices = {}
-                if 'baseline' in METHODS_TO_RUN:
-                    calculated_prices['baseline'] = calculate_baseline_prices(fixed_windows_errors)
-
-                for method, artifacts in trained_models.items():
-                    calculated_prices[method] = calculate_cluster_prices(
-                        fixed_windows_errors,
-                        artifacts['centroid_prices'],
-                        artifacts['final_centroids'],
-                        scaler_kmeans,
-                        dimensionality_reducer,
-                        DIMENSIONALITY_REDUCTION['method'],
-                        inv_covs=artifacts['inv_covs']
-                    )
-                
-                # Ground-Truth Price Calculation from window contexts
-                ground_truth_prices = np.array([get_price_for_context(ctx) for ctx in ground_truth_contexts])
+                # Ground-Truth Price Calculation (using valid rows only)
+                context_col = 'CONTEXT' if 'CONTEXT' in run_df_with_errors.columns else 'context'
+                run_df_valid = run_df_with_errors[valid_mask].copy()
+                assert isinstance(run_df_valid, pd.DataFrame)  # Type assertion for linter
+                ground_truth_prices = calculate_ground_truth_price(run_df_valid, FIXED_WINDOW_SIZE)
 
                 # Evaluation and Analysis (Validation)
-                run_evals = perform_evaluation_and_plot(calculated_prices, ground_truth_prices, f"{group_name}_VAL", sim_id)
+                run_evals = perform_evaluation_and_plot(
+                    calculated_prices, 
+                    ground_truth_prices, 
+                    f"{group_name}_VAL", 
+                    sim_id,
+                    post_process_config
+                )
                 
                 # Store results for the group-level summary plot
                 if calculated_prices and ground_truth_prices.size > 0:
@@ -2141,9 +2054,8 @@ def main():
                 continue
         
         # After processing all runs in a group, create the summary plots
-        if not FAST_VALIDATION.get('skip_plots', False):
-            plot_group_summary_tracking(f"{group_name}_TRAIN", train_run_results_for_plotting)
-            plot_group_summary_tracking(f"{group_name}_VAL", validation_run_results_for_plotting)
+        plot_group_summary_tracking(f"{group_name}_TRAIN", train_run_results_for_plotting)
+        plot_group_summary_tracking(f"{group_name}_VAL", validation_run_results_for_plotting)
     
     # === Step 6: Final Comparison Across Physics Groups ===
     if not all_results_list:
@@ -2159,20 +2071,12 @@ def main():
 
     # Create and print the summary table with mean and standard deviation for focused metrics
     agg_metrics = summary_df.groupby(['mass', 'friction', 'method', 'data_type']).agg(
-        # Original metrics
-        orig_corr_mean=('pearson_corr', 'mean'),
-        orig_corr_std=('pearson_corr', 'std'),
-        orig_mae_mean=('mae', 'mean'),
-        orig_mae_std=('mae', 'std'),
-        orig_rmse_mean=('rmse', 'mean'),
-        orig_rmse_std=('rmse', 'std'),
-        # Median-inverted stretched metrics  
-        stretch_corr_mean=('stretched_corr', 'mean'),
-        stretch_corr_std=('stretched_corr', 'std'),
-        stretch_mae_mean=('stretched_mae', 'mean'),
-        stretch_mae_std=('stretched_mae', 'std'),
-        stretch_rmse_mean=('stretched_rmse', 'mean'),
-        stretch_rmse_std=('stretched_rmse', 'std')
+        corr_mean=('pearson_corr', 'mean'),
+        corr_std=('pearson_corr', 'std'),
+        mae_mean=('mae', 'mean'),
+        mae_std=('mae', 'std'),
+        rmse_mean=('rmse', 'mean'),
+        rmse_std=('rmse', 'std')
     ).reset_index()
     
     agg_path = os.path.join(RESULTS_DIR, "summary_evaluation_by_group_experiment2.csv")
@@ -2180,27 +2084,20 @@ def main():
     print("\n" + "="*100)
     print("🎯 EXPERIMENT 2 RESULTS: Enhanced Features + Reconstruction Error Signals + Baseline")
     print("="*100)
-    print("📊 Methods: KMeans (context-aware) + Baseline (raw error magnitudes)")
-    print("🔍 Analysis: Original + Median-Inverted [1-50] costs")
-    print("🎯 Strategy: Relative threshold assignment (80% closer)")
+    print("📊 Methods: KMeans (context-aware) + Baseline (raw error magnitudes) + Hybrid")
+    print("✍️ Analysis: Original cost for Baseline & Hybrid. Post-processed for KMeans.")
+    print(f"🎯 KMeans Pricing Strategy: {PRICING_STRATEGY['method']} ({PRICING_STRATEGY['threshold_distance']*100}% closer)")
     print("="*100)
     print(agg_metrics.to_string())
     print(f"\nDetailed results saved to {summary_path}")
     print(f"Summary table saved to {agg_path}")
     print("\n💡 Key Metrics Explanation:")
-    print("  - orig_corr_mean: Mean original correlation")
-    print("  - orig_corr_std: Standard deviation of original correlation")
-    print("  - orig_mae_mean: Mean absolute error with original prices")
-    print("  - orig_mae_std: Standard deviation of absolute error with original prices")
-    print("  - orig_rmse_mean: Mean root mean squared error with original prices")
-    print("  - orig_rmse_std: Standard deviation of root mean squared error with original prices")
-    print("  - stretch_corr_mean: Mean correlation with median-inverted costs [1-50]")
-    print("  - stretch_corr_std: Standard deviation of correlation with median-inverted costs [1-50]")
-    print("  - stretch_mae_mean: Mean absolute error with median-inverted costs [1-50]")
-    print("  - stretch_mae_std: Standard deviation of absolute error with median-inverted costs [1-50]")
-    print("  - stretch_rmse_mean: Mean root mean squared error with median-inverted costs [1-50]")
-    print("  - stretch_rmse_std: Standard deviation of root mean squared error with median-inverted costs [1-50]")
-    print("  - Baseline method: Context-agnostic, pure reconstruction error magnitude")
+    print("  - corr_mean: Mean pearson correlation")
+    print("  - mae_mean: Mean absolute error")
+    print("  - rmse_mean: Mean root mean squared error")
+    print("  - Note: Costs used for evaluation are:")
+    print("    - Baseline/Hybrid: Original calculated costs")
+    print("    - KMeans: Post-processed costs")
     print("="*100)
 
 if __name__ == "__main__":

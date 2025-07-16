@@ -232,3 +232,4 @@ json_data/
 *.png
 *.pth
 *.pkl
+*.json

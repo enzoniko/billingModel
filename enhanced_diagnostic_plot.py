@@ -17,6 +17,7 @@ from recurrent_autoencoder_anomaly_detection import VehicleAutoencoder, SENSORS_
 
 # Import SSWT for wavelet analysis
 from ssqueezepy import ssq_cwt
+import matplotlib.patches as mpatches
 
 # --- Configuration ---
 PROCESSED_DATA_DIR = "processed_data"
@@ -564,83 +565,156 @@ def plot_enhanced_sensor_data_with_reconstruction_errors(df: pd.DataFrame, sim_i
     plt.close()
     print(f"Enhanced plot saved to: {output_path}")
 
+# NEW FUNCTION: Before/After bar plots for IMU_ACC_Z_DYNAMIC
+
+def plot_before_after_boxplots(df: pd.DataFrame, sim_id: int, context_colors: dict):
+    """Create a compact 2×1 boxplot figure for the dynamic Z-axis acceleration
+    before and after auto-encoder preprocessing. All fonts fixed to 18 pt so the figure
+    can be dropped into a single column of a double-column paper.
+    """
+    # Ensure required columns exist
+    before_col = "IMU_ACC_Z_DYNAMIC"
+    after_col = "IMU_ACC_Z_DYNAMIC_reconstruction_error"
+    if before_col not in df.columns:
+        print(f"Warning: '{before_col}' not found – skipping before/after box plot.")
+        return
+    if after_col not in df.columns:
+        print(f"Warning: '{after_col}' not found – skipping before/after box plot.")
+        return
+
+    # Sort contexts for stable ordering – keep existing order except move 'road' last
+    unique_contexts = sorted([c for c in df['generic_context'].unique() if c != 'road']) + ['road']
+    if 'road' not in df['generic_context'].unique():
+        unique_contexts = sorted(df['generic_context'].unique())
+
+    # Prepare data for boxplots: a list of arrays for each context
+    before_data = [df.loc[df['generic_context'] == ctx, before_col].dropna().to_numpy() for ctx in unique_contexts]
+    after_data = [df.loc[df['generic_context'] == ctx, after_col].dropna().to_numpy() for ctx in unique_contexts]
+    
+    # Filter out empty contexts to prevent errors
+    valid_indices = [i for i, data in enumerate(before_data) if len(data) > 0]
+    if not valid_indices:
+        print(f"Sim {sim_id}: No valid data found for any context. Skipping plot.")
+        return
+        
+    unique_contexts = [unique_contexts[i] for i in valid_indices]
+    before_data = [before_data[i] for i in valid_indices]
+    after_data = [after_data[i] for i in valid_indices]
+
+
+    # Figure styling – 18 pt everywhere
+    plt.rcParams.update({
+        'font.size': 18,
+        'axes.titlesize': 18,
+        'axes.labelsize': 18,
+        'xtick.labelsize': 18,
+        'ytick.labelsize': 18,
+        'legend.fontsize': 18
+    })
+
+    fig, axes = plt.subplots(2, 1, figsize=(6, 8), constrained_layout=True, sharex=True)
+
+    box_colors = [context_colors.get(ctx, '#999999') for ctx in unique_contexts]
+    
+    # --- Helper to create and color boxplots ---
+    def create_boxplot(ax, data, colors):
+        bp = ax.boxplot(data, patch_artist=True, showfliers=False,  # Hiding outliers for scale clarity
+                        boxprops=dict(linewidth=1.5),
+                        medianprops=dict(color='black', linewidth=1.5),
+                        whiskerprops=dict(linewidth=1.5),
+                        capprops=dict(linewidth=1.5))
+        for patch, color in zip(bp['boxes'], colors):
+            patch.set_facecolor(color)
+            patch.set_alpha(0.8)
+
+    # --- Before plot ---
+    create_boxplot(axes[0], before_data, box_colors)
+    axes[0].set_ylabel('Acceleration [m/s²]')
+    axes[0].grid(True, axis='y', alpha=0.3)
+    # Use symlog to see distributions close to zero
+    axes[0].set_yscale('symlog', linthresh=0.01)
+
+    # --- After plot ---
+    create_boxplot(axes[1], after_data, box_colors)
+    axes[1].set_ylabel('Recon. Error (MAE)')
+    axes[1].grid(True, axis='y', alpha=0.3)
+    
+    # --- Legend and Axis cleanup ---
+    # Create legend handles
+    legend_patches = [mpatches.Patch(color=context_colors.get(ctx, '#999999'), label=ctx) 
+                      for ctx in unique_contexts]
+    
+    # Place legend horizontally above the subplots
+    fig.legend(handles=legend_patches, loc='upper center', bbox_to_anchor=(0.5, 1.12), 
+               ncol=3, frameon=False)
+
+    # Remove x-axis tick labels since legend provides context info
+    plt.setp(axes, xticks=[], xticklabels=[])
+    axes[1].tick_params(axis='x', which='both', bottom=False, top=False)
+
+
+    output_path = os.path.join(DIAGNOSTICS_DIR, f"sim_{sim_id}_z_dynamic_before_after_boxplots.png")
+    fig.savefig(output_path, dpi=300, bbox_inches='tight')
+    plt.close(fig)
+    print(f"Before/After Z-axis boxplot saved to: {output_path}")
+
 def main():
-    parser = argparse.ArgumentParser(description="Generate enhanced diagnostic plots with reconstruction errors")
-    parser.add_argument("--sim_id", type=int, required=True, help="The simulation ID to analyze")
-    args = parser.parse_args()
-
-    try:
-        # Determine which vehicle group this simulation belongs to
-        group_name = determine_vehicle_group(args.sim_id)
-        if group_name is None:
-            print(f"Error: Simulation {args.sim_id} does not belong to any known vehicle group")
-            return
-        
-        print(f"Simulation {args.sim_id} belongs to {group_name}")
-        
-        # Load trained model and scaler
-        print(f"Loading trained autoencoder model for {group_name}...")
+    # Loop through all possible simulation IDs instead of using argparse
+    for sim_id in range(1, 221):
+        print(f"\n--- Processing Simulation ID: {sim_id} ---")
         try:
-            model, scaler = load_trained_model(group_name)
-            print("Model loaded successfully!")
-        except FileNotFoundError as e:
-            print(f"Error: {e}")
-            print(f"Please train the autoencoder for {group_name} first using:")
-            print(f"python recurrent_autoencoder_anomaly_detection.py --group {group_name}")
-            return
-        
-        # Load simulation data
-        file_path = find_sim_file(args.sim_id)
-        print(f"Loading data from: {file_path}")
-        df = pd.read_csv(file_path)
-        
-        # Process data (same as original diagnostic_plot.py)
-        df = process_data_for_diagnostics(df, SAMPLING_FREQUENCY)
-        
-        print(f"Data shape after processing: {df.shape}")
-        print(f"Available columns: {list(df.columns)}")
-        
-        # Calculate reconstruction errors
-        print("Calculating reconstruction errors...")
-        df_with_errors = calculate_reconstruction_errors_for_simulation(df, model, scaler)
-        
-        # Create generic contexts and colors
-        context_col = 'CONTEXT' if 'CONTEXT' in df_with_errors.columns else 'context'
-        df_with_errors['generic_context'] = df_with_errors[context_col].apply(get_generic_context)
-        unique_contexts = sorted(df_with_errors['generic_context'].unique())
-        context_colors = get_context_colors(unique_contexts)
-        
-        print(f"Found contexts: {unique_contexts}")
-        
-        # Generate enhanced plots
-        plot_enhanced_sensor_data_with_reconstruction_errors(df_with_errors, args.sim_id, context_colors)
-        plot_reconstruction_error_sswt_spectrograms_by_context(df_with_errors, args.sim_id, context_colors, SAMPLING_FREQUENCY)
-        
-        # Print reconstruction error statistics
-        print(f"\nReconstruction Error Statistics:")
-        error_columns = [col for col in df_with_errors.columns if col.endswith('_reconstruction_error')]
-        for col in error_columns:
-            errors = df_with_errors[col].dropna()
-            if len(errors) > 0:
-                print(f"  {col}:")
-                print(f"    Mean: {errors.mean():.6f}")
-                print(f"    Std:  {errors.std():.6f}")
-                print(f"    Min:  {errors.min():.6f}")
-                print(f"    Max:  {errors.max():.6f}")
-                
-                # Context-specific statistics
-                for context in unique_contexts:
-                    context_mask = df_with_errors['generic_context'] == context
-                    context_errors = df_with_errors.loc[context_mask, col].dropna()
-                    if len(context_errors) > 0:
-                        print(f"    {context}: Mean={context_errors.mean():.6f}, Std={context_errors.std():.6f}")
-
-    except FileNotFoundError as e:
-        print(f"Error: {e}")
-    except Exception as e:
-        print(f"An unexpected error occurred: {e}")
-        import traceback
-        traceback.print_exc()
+            # Determine which vehicle group this simulation belongs to
+            group_name = determine_vehicle_group(sim_id)
+            if group_name is None:
+                print(f"Info: Simulation {sim_id} does not belong to any known vehicle group, skipping.")
+                continue
+            
+            print(f"Simulation {sim_id} belongs to {group_name}")
+            
+            # Load trained model and scaler
+            print(f"Loading trained autoencoder model for {group_name}...")
+            try:
+                model, scaler = load_trained_model(group_name)
+                print("Model loaded successfully!")
+            except FileNotFoundError as e:
+                print(f"Error: {e}")
+                print(f"Please train the autoencoder for {group_name} first using:")
+                print(f"python recurrent_autoencoder_anomaly_detection.py --group {group_name}")
+                # If one group model is missing, we might as well stop if they are sequential.
+                # For now, let's just skip to the next simulation.
+                continue
+            
+            # Load simulation data
+            file_path = find_sim_file(sim_id)
+            print(f"Loading data from: {file_path}")
+            df = pd.read_csv(file_path)
+            
+            # Process data (same as original diagnostic_plot.py)
+            df = process_data_for_diagnostics(df, SAMPLING_FREQUENCY)
+            
+            print(f"Data shape after processing: {df.shape}")
+            
+            # Calculate reconstruction errors
+            print("Calculating reconstruction errors...")
+            df_with_errors = calculate_reconstruction_errors_for_simulation(df, model, scaler)
+            
+            # Create generic contexts and colors
+            context_col = 'CONTEXT' if 'CONTEXT' in df_with_errors.columns else 'context'
+            df_with_errors['generic_context'] = df_with_errors[context_col].apply(get_generic_context)
+            unique_contexts = sorted(df_with_errors['generic_context'].unique())
+            context_colors = get_context_colors(unique_contexts)
+            
+            print(f"Found contexts: {unique_contexts}")
+            
+            # Generate ONLY the compact before/after box plot
+            plot_before_after_boxplots(df_with_errors, sim_id, context_colors)
+            
+        except FileNotFoundError:
+            print(f"Info: No data file found for simulation {sim_id}, skipping.")
+        except Exception as e:
+            print(f"An unexpected error occurred for sim {sim_id}: {e}")
+            import traceback
+            traceback.print_exc()
 
 if __name__ == "__main__":
     main() 
